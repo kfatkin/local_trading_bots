@@ -21,7 +21,7 @@ stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 option_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
 stock_stream = StockDataStream(API_KEY, SECRET_KEY)
 
-SYMBOLS = ['TSLA', 'NVDA', 'AMD', 'META', 'NFLX', 'MSFT', 'AAPL', 'AMZN']
+SYMBOLS = ['TSLA', 'NVDA', 'GOOGL', 'AMD', 'META', 'NFLX', 'MSFT', 'AAPL', 'AMZN', 'INTC']
 
 # State management for active trades
 # Format: { 'TSLA': {'option_symbol': 'TSLA26...', 'side': 'CALL', 'qty': 10, 'tp1_qty': 7, ...} }
