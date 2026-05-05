@@ -38,7 +38,15 @@ The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX
 
 - colima start
 - docker build -t powerbar-bot .
-- docker run --env-file .env powerbar-bot
+- docker rm -f powerbar-bot 2>/dev/null || true
+- docker run --rm --name powerbar-bot --env-file .env powerbar-bot
+
+If Alpaca returns `connection limit exceeded`, you still have another live websocket client attached to the same account. Check for stale containers and stop them before retrying:
+
+```bash
+docker ps --filter name=powerbar-bot
+docker stop powerbar-bot
+```
 
 ### Issues?
 

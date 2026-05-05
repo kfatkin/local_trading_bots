@@ -1,6 +1,5 @@
 import os
 import math
-import asyncio
 from datetime import datetime
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
@@ -26,6 +25,30 @@ SYMBOLS = ['TSLA', 'NVDA', 'GOOGL', 'AMD', 'META', 'NFLX', 'MSFT', 'AAPL', 'AMZN
 # State management for active trades
 # Format: { 'TSLA': {'option_symbol': 'TSLA26...', 'side': 'CALL', 'qty': 10, 'tp1_qty': 7, ...} }
 active_positions = {}
+
+
+def validate_configuration():
+    if not API_KEY or not SECRET_KEY:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env."
+        )
+
+
+def log_startup_context():
+    account = trade_client.get_account()
+    clock = trade_client.get_clock()
+    print(
+        f"[{datetime.now()}] Authenticated with Alpaca. "
+        f"paper={PAPER} account_status={account.status} buying_power={account.buying_power}"
+    )
+    print(
+        f"[{datetime.now()}] Starting StockDataStream for {len(SYMBOLS)} symbols. "
+        f"market_open={clock.is_open} next_open={clock.next_open} next_close={clock.next_close}"
+    )
+    print(
+        "StockDataStream only provides market-data bars. "
+        "If you want broker/order updates, use alpaca.trading.stream.TradingStream."
+    )
 
 def get_power_bar_setup(symbol):
     """Evaluates the 2-minute chart for a Power Bar setup."""
@@ -179,10 +202,11 @@ async def handle_bar(bar):
         if setup:
             execute_entry(symbol, setup)
 
-async def main():
-    print("Connecting to Alpaca WebSocket...")
+def main():
+    validate_configuration()
+    log_startup_context()
     stock_stream.subscribe_bars(handle_bar, *SYMBOLS)
-    await stock_stream._run_forever()
+    stock_stream.run()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
