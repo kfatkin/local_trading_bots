@@ -4,26 +4,27 @@ An automated options trading bot built with Python and `alpaca-py`. This bot use
 
 ## Features
 
-* **Real-Time Data Ingestion:** Utilizes Alpaca's `StockDataStream` for zero-latency bar evaluation.
-* **Automated Options Execution:** Scans the options chain for the nearest expiration with an absolute Delta $\le$ 0.30 and a premium under $4.00.
-* **Dynamic Position Sizing:** Automatically calculates position sizes based on 5% of your available Account Buying Power.
-* **Advanced Trade Management:** * Automatically exits 75% of the position at 1.5R (Reward/Risk).
-  * Exits the remaining 25% at 2.0R.
-  * Triggers a Stop Loss if the underlying asset closes above/below the origin of the Power Bar.
-* **Dockerized:** Ready to run locally or deploy to cloud infrastructure (AWS ECS, EKS, etc.) with minimal configuration.
+- **Real-Time Data Ingestion:** Utilizes Alpaca's `StockDataStream` for zero-latency bar evaluation.
+- **Automated Options Execution:** Scans the options chain for the nearest expiration with an absolute Delta $\le$ 0.30 and a premium under $4.00.
+- **Dynamic Position Sizing:** Automatically calculates position sizes based on 5% of your available Account Buying Power.
+- **Advanced Trade Management:** \* Automatically exits 75% of the position at 1.5R (Reward/Risk).
+  - Exits the remaining 25% at 2.0R.
+  - Triggers a Stop Loss if the underlying asset closes above/below the origin of the Power Bar.
+- **Dockerized:** Ready to run locally or deploy to cloud infrastructure (AWS ECS, EKS, etc.) with minimal configuration.
 
 ## Strategy: The "Power Bar"
 
 The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX`, `MSFT`, `AAPL`, `AMZN`) for the following conditions on a 2-minute chart:
+
 1. **Volatility/Size:** The current candle's body is at least 2x larger than the average body size of the previous 5 candles.
 2. **Moving Average Anchor:** The candle opens near the 20-period Simple Moving Average (SMA).
 3. **Liquidity Sweep / Resistance Break:** The candle closes above the highest high (for longs) or below the lowest low (for shorts) of the previous 10 periods.
 
 ## Prerequisites
 
-* An [Alpaca](https://alpaca.markets/) Trading Account (Paper trading highly recommended for initial setup).
-* Docker installed on your local machine.
-* *For macOS users using Colima:* Ensure Colima is installed and running to manage your Docker daemon.
+- An [Alpaca](https://alpaca.markets/) Trading Account (Paper trading highly recommended for initial setup).
+- Docker installed on your local machine.
+- _For macOS users using Colima:_ Ensure Colima is installed and running to manage your Docker daemon.
 
 ## Installation & Setup
 
@@ -33,13 +34,29 @@ The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX
    ```env
    ALPACA_API_KEY=your_paper_api_key_here
    ALPACA_SECRET_KEY=your_paper_secret_key_here
+   ALPACA_PAPER=true
+   ```
+
+Set `ALPACA_PAPER=false` only when you intentionally want to route orders to a live account.
+
+The container persists bot runtime files under `./runtime` on your machine:
+
+- `runtime/powerbar-bot.log` keeps a durable execution log, including fills, rejections, and restart reconciliation messages.
+- `runtime/state.json` stores local stop-loss and target state so the bot can resume management after a container restart.
+
+3. **Streaming Behavior:**
+   The bot uses two Alpaca websocket connections:
+
+- `StockDataStream` for market bars used by the strategy.
+- `TradingStream` for account order and fill updates, which the bot uses to confirm entries and exits.
 
 ## Mac OS X commands:
 
 - colima start
 - docker build -t powerbar-bot .
+- mkdir -p runtime
 - docker rm -f powerbar-bot 2>/dev/null || true
-- docker run --rm --name powerbar-bot --env-file .env powerbar-bot
+- docker run --rm --name powerbar-bot --env-file .env -v "$(pwd)/runtime:/app/runtime" powerbar-bot
 
 If Alpaca returns `connection limit exceeded`, you still have another live websocket client attached to the same account. Check for stale containers and stop them before retrying:
 
@@ -55,4 +72,5 @@ docker stop powerbar-bot
 - colima start
 
 ## DISCLAIMER
+
 USE AT YOUR OWN RISK. This software is for educational and experimental purposes only. Options trading carries a high level of risk and may not be suitable for all investors. The automated nature of this script means it can execute trades rapidly and incur losses quickly. Always run new algorithmic trading scripts in a Paper Trading environment over an extended period to verify logic before deploying real capital. The authors of this script assume no responsibility for any financial losses incurred.
