@@ -1,2 +1,2 @@
-docker build -t power-bar-bot .
-docker run --env-file .env power-bar-bot
+docker build -t powerbar-bot .
+docker run --env-file .env powerbar-bot
