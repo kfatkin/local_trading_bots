@@ -22,7 +22,8 @@ The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX
 ## Prerequisites
 
 * An [Alpaca](https://alpaca.markets/) Trading Account (Paper trading highly recommended for initial setup).
-* [Docker](https://www.docker.com/) installed on your local machine or deployment server.
+* Docker installed on your local machine.
+* *For macOS users using Colima:* Ensure Colima is installed and running to manage your Docker daemon.
 
 ## Installation & Setup
 
@@ -32,3 +33,18 @@ The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX
    ```env
    ALPACA_API_KEY=your_paper_api_key_here
    ALPACA_SECRET_KEY=your_paper_secret_key_here
+
+## Mac OS X commands:
+
+- colima start
+- docker build -t powerbar-bot .
+- docker run --env-file .env powerbar-bot
+
+### Issues?
+
+- colima stop
+- colima delete
+- colima start
+
+## DISCLAIMER
+USE AT YOUR OWN RISK. This software is for educational and experimental purposes only. Options trading carries a high level of risk and may not be suitable for all investors. The automated nature of this script means it can execute trades rapidly and incur losses quickly. Always run new algorithmic trading scripts in a Paper Trading environment over an extended period to verify logic before deploying real capital. The authors of this script assume no responsibility for any financial losses incurred.
