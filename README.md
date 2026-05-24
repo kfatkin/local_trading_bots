@@ -1,76 +1,90 @@
-# Alpaca Power Bar Options Trading Bot
+# Flow Sweep Options Trading Bot
 
-An automated options trading bot built with Python and `alpaca-py`. This bot uses Alpaca's WebSocket API to stream real-time 1-minute market data, evaluating high-beta, large-cap equities for a specific "Power Bar" technical setup on the 2-minute timeframe. When triggered, it automatically sizes and routes long Call or Put option orders with predefined risk management.
+An automated options trading bot built with Python and `alpaca-py`. It reads prior-session scored options flow from `uw-hub` DynamoDB data, builds a bullish or bearish watchlist, then waits for 5-minute reclaim/rejection setups around important market levels.
 
-## Features
+## Strategy
 
-- **Real-Time Data Ingestion:** Utilizes Alpaca's `StockDataStream` for zero-latency bar evaluation.
-- **Automated Options Execution:** Scans the options chain for the nearest expiration with an absolute Delta $\le$ 0.30 and a premium under $4.00.
-- **Dynamic Position Sizing:** Automatically calculates position sizes based on 5% of your available Account Buying Power.
-- **Advanced Trade Management:** \* Automatically exits 75% of the position at 1.5R (Reward/Risk).
-  - Exits the remaining 25% at 2.0R.
-  - Triggers a Stop Loss if the underlying asset closes above/below the origin of the Power Bar.
-- **Dockerized:** Ready to run locally or deploy to cloud infrastructure (AWS ECS, EKS, etc.) with minimal configuration.
+The bot watches:
 
-## Strategy: The "Power Bar"
+- `AMD`
+- `AAPL`
+- `AMZN`
+- `GOOGL`
+- `META`
+- `MU`
+- `INTC`
+- `NVDA`
+- `TSLA`
+- `STX`
+- `SNDK`
 
-The bot scans a predefined list of tickers (`TSLA`, `NVDA`, `AMD`, `META`, `NFLX`, `MSFT`, `AAPL`, `AMZN`) for the following conditions on a 2-minute chart:
+Before the trading session, it queries the `uw-data` DynamoDB table with AWS profile `trading_bot` and looks for `_flow_scores_trading_bot` rows from the prior NYSE regular session where `composite_score > 70`.
 
-1. **Volatility/Size:** The current candle's body is at least 2x larger than the average body size of the previous 5 candles.
-2. **Moving Average Anchor:** The candle opens near the 20-period Simple Moving Average (SMA).
-3. **Liquidity Sweep / Resistance Break:** The candle closes above the highest high (for longs) or below the lowest low (for shorts) of the previous 10 periods.
+For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 60% of the total directional premium.
 
-## Prerequisites
+For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant low and closes back above it, the bot buys calls.
 
-- An [Alpaca](https://alpaca.markets/) Trading Account (Paper trading highly recommended for initial setup).
-- Docker installed on your local machine.
-- _For macOS users using Colima:_ Ensure Colima is installed and running to manage your Docker daemon.
+For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant high and closes back below it, the bot buys puts.
 
-## Installation & Setup
+Contracts are selected from the nearest expiration, including 0DTE when available, by choosing the contract closest to absolute `0.30` delta. There is no premium cap.
 
-1. **Clone or create the project directory** and ensure `main.py`, `requirements.txt`, and `Dockerfile` are present.
-2. **Create an Environment File:**
-   In the root of the project directory, create a file named `.env` and add your Alpaca Paper API credentials:
-   ```env
-   ALPACA_API_KEY=your_paper_api_key_here
-   ALPACA_SECRET_KEY=your_paper_secret_key_here
-   ALPACA_PAPER=true
-   ```
+## Risk And Exits
 
-Set `ALPACA_PAPER=false` only when you intentionally want to route orders to a live account.
+- Default account mode is paper trading through `ALPACA_PAPER=true` or the built-in default.
+- Position size is 5% of available buying power.
+- Stop is the sweep candle extreme.
+- Target is the first opposing key level hit: premarket, prior-day, or prior-week high for calls; premarket, prior-day, or prior-week low for puts.
+- Remaining positions are closed near end of day at 15:55 ET.
+- Local runtime state is persisted under `runtime/state.json` so open option positions can be reconciled after restart.
 
-The container persists bot runtime files under `./runtime` on your machine:
+## Configuration
 
-- `runtime/powerbar-bot.log` keeps a durable execution log, including fills, rejections, and restart reconciliation messages.
-- `runtime/state.json` stores local stop-loss and target state so the bot can resume management after a container restart.
+Create `.env` in this folder with Alpaca credentials:
 
-3. **Streaming Behavior:**
-   The bot uses two Alpaca websocket connections:
-
-- `StockDataStream` for market bars used by the strategy.
-- `TradingStream` for account order and fill updates, which the bot uses to confirm entries and exits.
-
-## Mac OS X commands:
-
-- colima start
-- docker build -t powerbar-bot .
-- mkdir -p runtime
-- docker rm -f powerbar-bot 2>/dev/null || true
-- docker run --rm --name powerbar-bot --env-file .env -v "$(pwd)/runtime:/app/runtime" powerbar-bot
-
-If Alpaca returns `connection limit exceeded`, you still have another live websocket client attached to the same account. Check for stale containers and stop them before retrying:
-
-```bash
-docker ps --filter name=powerbar-bot
-docker stop powerbar-bot
+```env
+ALPACA_API_KEY=your_paper_api_key_here
+ALPACA_SECRET_KEY=your_paper_secret_key_here
+ALPACA_PAPER=true
 ```
 
-### Issues?
+Optional settings:
 
-- colima stop
-- colima delete
-- colima start
+```env
+AWS_PROFILE=trading_bot
+AWS_REGION=us-east-2
+UW_TABLE_NAME=uw-data
+UW_FLOW_SCORE_PARTITION=_flow_scores_trading_bot
+FLOW_SWEEP_MIN_SCORE=70
+FLOW_SWEEP_CONSENSUS_THRESHOLD=0.60
+FLOW_SWEEP_TRADE_ALLOCATION_PCT=0.05
+FLOW_SWEEP_TARGET_DELTA=0.30
+ALPACA_DATA_FEED=iex
+```
 
-## DISCLAIMER
+The Docker launcher mounts `$HOME/.aws` read-only so the container can use the local `trading_bot` AWS profile.
 
-USE AT YOUR OWN RISK. This software is for educational and experimental purposes only. Options trading carries a high level of risk and may not be suitable for all investors. The automated nature of this script means it can execute trades rapidly and incur losses quickly. Always run new algorithmic trading scripts in a Paper Trading environment over an extended period to verify logic before deploying real capital. The authors of this script assume no responsibility for any financial losses incurred.
+## Run Locally
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+Manual Docker run:
+
+```bash
+docker build -t flow-sweep-bot .
+mkdir -p runtime
+docker rm -f flow-sweep-bot 2>/dev/null || true
+docker run --rm --name flow-sweep-bot \
+  --env-file .env \
+  -e AWS_PROFILE="${AWS_PROFILE:-trading_bot}" \
+  -e AWS_REGION="${AWS_REGION:-us-east-2}" \
+  -v "$HOME/.aws:/root/.aws:ro" \
+  -v "$(pwd)/runtime:/app/runtime" \
+  flow-sweep-bot
+```
+
+## Disclaimer
+
+Use at your own risk. This software is for educational and experimental purposes only. Options trading carries substantial risk, and automated trading can execute orders rapidly. Test in paper trading before considering live mode.
