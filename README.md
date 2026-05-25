@@ -59,9 +59,33 @@ FLOW_SWEEP_CONSENSUS_THRESHOLD=0.60
 FLOW_SWEEP_TRADE_ALLOCATION_PCT=0.05
 FLOW_SWEEP_TARGET_DELTA=0.30
 ALPACA_DATA_FEED=iex
+BOT_DASHBOARD_ENABLED=true
+BOT_DASHBOARD_HOST=127.0.0.1
+BOT_DASHBOARD_PORT=8765
 ```
 
 The Docker launcher mounts `$HOME/.aws` read-only so the container can use the local `trading_bot` AWS profile.
+
+## Dashboard
+
+When the bot is running, open:
+
+```text
+http://localhost:8765
+```
+
+The dashboard shows the current session, prior session, flow decision for each watched symbol, planned call/put trigger levels, target levels, active positions, pending orders, and recent completed 5-minute bars.
+
+The decision table makes the planned entries explicit:
+
+- Bullish symbols show the lows where the bot will look for call entries.
+- Bearish symbols show the highs where the bot will look for put entries.
+
+The same status is available as JSON at:
+
+```text
+http://localhost:8765/api/status
+```
 
 ## Run Locally
 
@@ -80,6 +104,9 @@ docker run --rm --name flow-sweep-bot \
   --env-file .env \
   -e AWS_PROFILE="${AWS_PROFILE:-trading_bot}" \
   -e AWS_REGION="${AWS_REGION:-us-east-2}" \
+  -e BOT_DASHBOARD_HOST="0.0.0.0" \
+  -e BOT_DASHBOARD_PORT="${BOT_DASHBOARD_PORT:-8765}" \
+  -p "${BOT_DASHBOARD_PORT:-8765}:${BOT_DASHBOARD_PORT:-8765}" \
   -v "$HOME/.aws:/root/.aws:ro" \
   -v "$(pwd)/runtime:/app/runtime" \
   flow-sweep-bot
