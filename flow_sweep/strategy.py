@@ -83,20 +83,113 @@ def log_startup_context():
     )
 
 
-def build_trade_setup(symbol, bias, trading_day, prior_day, week_sessions):
+def level_payload(name, label, side, price=None, status="ready", role="skipped", note=None):
+    return {
+        "name": name,
+        "label": label,
+        "side": side,
+        "price": round(float(price), 4) if price not in (None, "") else None,
+        "status": status,
+        "role": role,
+        "note": note,
+    }
+
+
+def missing_level(name, label, side):
+    return level_payload(name, label, side, status="missing", note="Level unavailable")
+
+
+def pending_premarket_levels():
+    return [
+        level_payload("premarket_low", "Premarket Low", "support", status="pending", note="Pending until upcoming premarket completes"),
+        level_payload("premarket_high", "Premarket High", "resistance", status="pending", note="Pending until upcoming premarket completes"),
+    ]
+
+
+def build_symbol_key_levels(symbol, trading_day, prior_day, week_sessions, include_premarket):
     prior_range = get_day_high_low(symbol, prior_day)
     week_range = get_week_high_low(symbol, week_sessions)
-    premarket_range = get_premarket_high_low(symbol, trading_day)
+    premarket_range = get_premarket_high_low(symbol, trading_day) if include_premarket else None
 
-    if not prior_range or not week_range or not premarket_range:
-        LOGGER.warning("%s skipped: missing levels prior=%s week=%s premarket=%s", symbol, bool(prior_range), bool(week_range), bool(premarket_range))
+    if premarket_range:
+        premarket_high, premarket_low = premarket_range
+        premarket_levels = [
+            level_payload("premarket_low", "Premarket Low", "support", premarket_low),
+            level_payload("premarket_high", "Premarket High", "resistance", premarket_high),
+        ]
+    elif include_premarket:
+        premarket_levels = [
+            missing_level("premarket_low", "Premarket Low", "support"),
+            missing_level("premarket_high", "Premarket High", "resistance"),
+        ]
+    else:
+        premarket_levels = pending_premarket_levels()
+
+    if prior_range:
+        prior_high, prior_low = prior_range
+        prior_levels = [
+            level_payload("prior_day_low", "Prior Day Low", "support", prior_low),
+            level_payload("prior_day_high", "Prior Day High", "resistance", prior_high),
+        ]
+    else:
+        prior_levels = [
+            missing_level("prior_day_low", "Prior Day Low", "support"),
+            missing_level("prior_day_high", "Prior Day High", "resistance"),
+        ]
+
+    if week_range:
+        week_high, week_low = week_range
+        week_levels = [
+            level_payload("prior_week_low", "Prior Week Low", "support", week_low),
+            level_payload("prior_week_high", "Prior Week High", "resistance", week_high),
+        ]
+    else:
+        week_levels = [
+            missing_level("prior_week_low", "Prior Week Low", "support"),
+            missing_level("prior_week_high", "Prior Week High", "resistance"),
+        ]
+
+    return premarket_levels + prior_levels + week_levels
+
+
+def apply_level_roles(levels, bias):
+    if not bias:
+        return [{**level, "role": "skipped", "note": level.get("note") or "Skipped: no actionable directional bias"} for level in levels]
+
+    observed_side = "support" if bias.direction == "bullish" else "resistance"
+    observed_note = "Observed for call entries after a 5m sweep and close back above" if bias.direction == "bullish" else "Observed for put entries after a 5m sweep and close back below"
+    skipped_note = "Skipped for this bullish setup" if bias.direction == "bullish" else "Skipped for this bearish setup"
+    role_levels = []
+    for level in levels:
+        is_observed = level["side"] == observed_side
+        note = observed_note if is_observed else skipped_note
+        role_levels.append({**level, "role": "observed" if is_observed else "skipped", "note": level.get("note") or note})
+    return role_levels
+
+
+def setup_from_key_levels(symbol, bias, key_levels):
+    levels_by_name = {level["name"]: level for level in key_levels if level.get("price") is not None and level.get("status") == "ready"}
+    needed = {"premarket_low", "premarket_high", "prior_day_low", "prior_day_high", "prior_week_low", "prior_week_high"}
+    if not needed.issubset(levels_by_name):
+        LOGGER.warning(
+            "%s skipped: missing levels premarket=%s prior=%s week=%s",
+            symbol,
+            "premarket_low" in levels_by_name and "premarket_high" in levels_by_name,
+            "prior_day_low" in levels_by_name and "prior_day_high" in levels_by_name,
+            "prior_week_low" in levels_by_name and "prior_week_high" in levels_by_name,
+        )
         return None
 
-    prior_high, prior_low = prior_range
-    week_high, week_low = week_range
-    premarket_high, premarket_low = premarket_range
-    support_levels = (KeyLevel("premarket_low", premarket_low), KeyLevel("prior_day_low", prior_low), KeyLevel("prior_week_low", week_low))
-    resistance_levels = (KeyLevel("premarket_high", premarket_high), KeyLevel("prior_day_high", prior_high), KeyLevel("prior_week_high", week_high))
+    support_levels = (
+        KeyLevel("premarket_low", levels_by_name["premarket_low"]["price"]),
+        KeyLevel("prior_day_low", levels_by_name["prior_day_low"]["price"]),
+        KeyLevel("prior_week_low", levels_by_name["prior_week_low"]["price"]),
+    )
+    resistance_levels = (
+        KeyLevel("premarket_high", levels_by_name["premarket_high"]["price"]),
+        KeyLevel("prior_day_high", levels_by_name["prior_day_high"]["price"]),
+        KeyLevel("prior_week_high", levels_by_name["prior_week_high"]["price"]),
+    )
 
     LOGGER.info(
         "%s %s setup: consensus=%.1f%% top_score=%s bull=$%.0f bear=$%.0f levels PM %.2f/%.2f PD %.2f/%.2f PW %.2f/%.2f",
@@ -106,12 +199,12 @@ def build_trade_setup(symbol, bias, trading_day, prior_day, week_sessions):
         bias.top_score,
         bias.bullish_premium,
         bias.bearish_premium,
-        premarket_high,
-        premarket_low,
-        prior_high,
-        prior_low,
-        week_high,
-        week_low,
+        levels_by_name["premarket_high"]["price"],
+        levels_by_name["premarket_low"]["price"],
+        levels_by_name["prior_day_high"]["price"],
+        levels_by_name["prior_day_low"]["price"],
+        levels_by_name["prior_week_high"]["price"],
+        levels_by_name["prior_week_low"]["price"],
     )
     return TradeSetup(symbol, bias, support_levels, resistance_levels)
 
@@ -156,6 +249,7 @@ def flow_error_decision(symbol, exc):
         "trigger_levels": [],
         "target_levels": [],
         "flow_rows": [],
+        "key_levels": [],
     }
 
 
@@ -193,6 +287,12 @@ def prepare_daily_context(now_et=None, force=False):
         prior_open = schedule.iloc[trading_idx - 1]["market_open"].to_pydatetime().astimezone(UTC)
         prior_close = schedule.iloc[trading_idx - 1]["market_close"].to_pydatetime().astimezone(UTC)
         biases, decisions = query_prior_session_flow(prior_open, prior_close)
+        week_sessions = previous_calendar_week_sessions(schedule, trading_day)
+        include_premarket = now_et.date() == trading_day and now_et.time() >= REGULAR_OPEN
+
+        for symbol, decision in decisions.items():
+            key_levels = build_symbol_key_levels(symbol, trading_day, prior_day, week_sessions, include_premarket)
+            decision["key_levels"] = apply_level_roles(key_levels, biases.get(symbol))
 
         if now_et.date() != trading_day or now_et.time() < REGULAR_OPEN:
             for symbol, decision in decisions.items():
@@ -223,13 +323,11 @@ def prepare_daily_context(now_et=None, force=False):
             )
             return
 
-        week_sessions = previous_calendar_week_sessions(schedule, trading_day)
-
         setups = {}
         for symbol, bias in biases.items():
             if not bias:
                 continue
-            setup = build_trade_setup(symbol, bias, trading_day, prior_day, week_sessions)
+            setup = setup_from_key_levels(symbol, bias, decisions[symbol].get("key_levels", []))
             if setup:
                 setups[symbol] = setup
                 decisions[symbol].update(setup_plan_summary(setup))
