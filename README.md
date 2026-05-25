@@ -162,6 +162,14 @@ python3 main.py --entry-preflight
 
 This checks the live Alpaca account, clock, contract chain, snapshots, liquidity filters, buying power, and quote freshness without submitting orders. When run outside market hours, quote-age issues are reported as warnings rather than blocking failures.
 
+Historical backtest using UW scored-flow rows and underlying price data:
+
+```bash
+python3 scripts/backtest_flow_sweep.py --sessions 40
+```
+
+The backtest writes markdown and CSV logs to `runtime/backtests/`. It measures the strategy in underlying R multiples and approximates the breakeven stop as an underlying entry-price stop because historical option bid/ask replay is not included.
+
 Docker smoke test after building the image:
 
 ```bash

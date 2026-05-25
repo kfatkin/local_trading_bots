@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+import csv
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ from .config import (
     MIN_FLOW_SCORE,
     OPTION_PREVIEW_REFRESH_SECONDS,
     PAPER,
+    RUNTIME_DIR,
     SYMBOLS,
     TARGET_DELTA,
     TRADE_ALLOCATION_PCT,
@@ -234,6 +236,53 @@ def completed_bar_payload(symbol, bar):
     }
 
 
+def latest_backtest_payload():
+    backtest_dir = RUNTIME_DIR / "backtests"
+    markdown_files = sorted(backtest_dir.glob("flow_sweep_backtest_*.md"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not markdown_files:
+        return {
+            "available": False,
+            "reason": "No backtest logs found. Run python3 scripts/backtest_flow_sweep.py --sessions 40 to generate one.",
+            "directory": str(backtest_dir),
+        }
+
+    markdown_path = markdown_files[0]
+    csv_path = markdown_path.with_suffix(".csv")
+    csv_rows = []
+    if csv_path.exists():
+        with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+            csv_rows = list(csv.DictReader(csv_file))
+
+    trades = [row for row in csv_rows if row.get("status") == "TRADE"]
+    wins = [row for row in trades if float(row.get("r_multiple") or 0.0) > 0]
+    losses = [row for row in trades if float(row.get("r_multiple") or 0.0) < 0]
+    breakeven = [row for row in trades if float(row.get("r_multiple") or 0.0) == 0]
+    gross_win = sum(float(row.get("r_multiple") or 0.0) for row in wins)
+    gross_loss = abs(sum(float(row.get("r_multiple") or 0.0) for row in losses))
+    profit_factor = gross_win / gross_loss if gross_loss else None
+    total_r = sum(float(row.get("r_multiple") or 0.0) for row in trades)
+
+    return {
+        "available": True,
+        "markdown_file": markdown_path.name,
+        "csv_file": csv_path.name if csv_path.exists() else None,
+        "updated_at": datetime.fromtimestamp(markdown_path.stat().st_mtime, ET).isoformat(),
+        "markdown": markdown_path.read_text(encoding="utf-8"),
+        "trade_rows": trades,
+        "summary": {
+            "rows": len(csv_rows),
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "breakeven": len(breakeven),
+            "win_rate": len(wins) / len(trades) if trades else 0.0,
+            "profit_factor": profit_factor,
+            "total_r": round(total_r, 4),
+            "avg_r": round(total_r / len(trades), 4) if trades else 0.0,
+        },
+    }
+
+
 def dashboard_status_payload():
     try:
         from .strategy import refresh_contract_previews_if_needed
@@ -367,7 +416,22 @@ DASHBOARD_HTML = """<!doctype html>
             top: 0;
             z-index: 2;
         }
+        .header-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
         h1 { margin: 0 0 8px; font-size: 22px; letter-spacing: 0; }
+        .header-row h1 { margin: 0; }
+        .toolbar { display: flex; align-items: center; gap: 8px; }
+        .toolbar-button {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 7px 10px;
+            background: color-mix(in srgb, var(--panel) 82%, var(--bg));
+            color: var(--text);
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .toolbar-button:hover { border-color: var(--ready); }
+        .toolbar-button.active { border-color: var(--ready); background: color-mix(in srgb, var(--ready) 12%, var(--panel)); }
         main { padding: 20px 24px 32px; display: grid; gap: 16px; }
         .meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--muted); }
         .pill {
@@ -427,6 +491,12 @@ DASHBOARD_HTML = """<!doctype html>
         .ok { color: var(--bull); font-weight: 700; }
         .warn { color: var(--warn); font-weight: 700; }
         .event-type { font-weight: 700; white-space: nowrap; }
+        .hidden { display: none; }
+        .backtest-summary { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+        .backtest-card { border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: color-mix(in srgb, var(--panel) 90%, var(--bg)); }
+        .backtest-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+        .backtest-card .value { font-weight: 800; font-size: 18px; }
+        .backtest-markdown { max-height: 480px; overflow: auto; white-space: pre-wrap; background: color-mix(in srgb, var(--panel) 88%, var(--bg)); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
         .flow-detail-row td { background: color-mix(in srgb, var(--panel) 92%, var(--bg)); padding-top: 0; }
         .flow-details summary { cursor: pointer; color: var(--muted); font-weight: 700; padding: 8px 0; }
         .flow-details[open] summary { color: var(--text); }
@@ -437,17 +507,26 @@ DASHBOARD_HTML = """<!doctype html>
         .flag { border: 1px solid var(--border); border-radius: 6px; padding: 2px 5px; white-space: nowrap; }
         .section-title { margin: 8px 0 6px; font-size: 18px; }
         .wide { overflow-x: auto; }
-        @media (max-width: 980px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 980px) { .grid, .backtest-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 640px) { header, main { padding-left: 12px; padding-right: 12px; } .grid { grid-template-columns: 1fr; } th, td { padding: 8px 6px; } }
     </style>
 </head>
 <body>
     <header>
-        <h1>Flow Sweep Bot</h1>
+        <div class="header-row">
+            <h1>Flow Sweep Bot</h1>
+            <div class="toolbar">
+                <button class="toolbar-button" id="backtest-button" type="button" onclick="toggleBacktest()">Backtest</button>
+            </div>
+        </div>
         <div class="meta" id="meta"></div>
     </header>
     <main>
         <section class="grid" id="metrics"></section>
+        <section class="hidden" id="backtest-section">
+            <h2 class="section-title">Backtest Results</h2>
+            <div class="panel" id="backtest-panel"><span class="muted">Click Backtest to load the latest generated result.</span></div>
+        </section>
         <section>
             <h2 class="section-title">Alpaca Snapshot</h2>
             <div class="wide"><table id="alpaca"></table></div>
