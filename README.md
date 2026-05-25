@@ -34,7 +34,8 @@ Contracts are selected from the nearest active expiration, including 0DTE when a
 - Position size is 5% of Alpaca account balance, using portfolio value/equity/cash before falling back to buying power.
 - If the 5% allocation cannot buy one contract, the bot can still buy one contract when that contract costs no more than 20% of account balance.
 - Stop is the sweep candle extreme.
-- Target is the first opposing key level hit: premarket, prior-day, or prior-week high for calls; premarket, prior-day, or prior-week low for puts.
+- Target is bot-managed. The bot uses the closest opposing key level only when that level offers at least 2R from the underlying entry-to-stop distance; otherwise it uses a fixed 2R underlying target so trades can still run into all-time highs or lows.
+- Once the underlying reaches 1.5R, the bot switches the stop mode to option breakeven and exits if the option market price falls back to the entry option price.
 - Remaining positions are closed near end of day at 15:55 ET.
 - Local runtime state is persisted under `runtime/state.json` so open option positions can be reconciled after restart.
 
@@ -59,6 +60,8 @@ FLOW_SWEEP_MIN_SCORE=70
 FLOW_SWEEP_CONSENSUS_THRESHOLD=0.60
 FLOW_SWEEP_TRADE_ALLOCATION_PCT=0.05
 FLOW_SWEEP_TARGET_DELTA=0.30
+FLOW_SWEEP_TARGET_R_MULTIPLE=2.0
+FLOW_SWEEP_BREAKEVEN_TRIGGER_R_MULTIPLE=1.5
 FLOW_SWEEP_OPTION_PREVIEW_REFRESH_SECONDS=300
 FLOW_SWEEP_OPTION_EXPIRATION_LOOKAHEAD_DAYS=21
 FLOW_SWEEP_OPTION_MAX_SPREAD_PCT=0.30
@@ -96,7 +99,7 @@ When the bot is running, open:
 http://127.0.0.1:8765
 ```
 
-The dashboard shows the current session, prior session, flow decision for each watched symbol, all six key levels, the planned option contract, target levels, active positions, pending orders, and recent completed 5-minute bars.
+The dashboard shows the current session, prior session, flow decision for each watched symbol, all six key levels, the planned option contract, target levels, active positions, Alpaca broker open orders, pending bot orders, and recent completed 5-minute bars.
 
 The key-level column lists premarket low/high, prior-day low/high, and prior-week low/high. Bullish setups mark support levels as observed for call entries after a sweep and 5-minute close back above. Bearish setups mark resistance levels as observed for put entries after a sweep and 5-minute close back below. The opposite side is shown as skipped for that setup, and upcoming-session premarket levels stay pending until they are available.
 
@@ -108,6 +111,8 @@ The decision table makes the planned entries explicit:
 - Bearish symbols show the highs where the bot will look for put entries.
 
 The planned contract column refreshes from Alpaca on the 5-minute strategy cadence and is also refreshed opportunistically by the dashboard with a 5-minute cache. It shows the selected contract symbol, strike, expiration, delta, gamma, theta, ask price, estimated cost per contract, planned quantity, spread, recent option volume, open interest, account balance, allocation amount, and any sizing/liquidity warnings. Live entries use the same selector and account-balance sizing shown in this preview.
+
+When a trade is active, the dashboard combines Alpaca broker truth with the bot plan. The active-position row shows Alpaca quantity, average entry, current mark, market value, cost basis, unrealized PnL, the bot-managed stop mode, the 1.5R breakeven trigger, the breakeven option stop price, and the selected take-profit target. Broker open option orders are listed separately from bot-local pending orders.
 
 The same status is available as JSON at:
 

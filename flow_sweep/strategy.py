@@ -21,7 +21,9 @@ from .config import (
     OPTION_PREVIEW_REFRESH_SECONDS,
     PAPER,
     REGULAR_OPEN,
+    BREAKEVEN_TRIGGER_R_MULTIPLE,
     SYMBOLS,
+    TARGET_R_MULTIPLE,
     TARGET_DELTA,
     TRADE_ALLOCATION_PCT,
     UTC,
@@ -36,7 +38,7 @@ from .market_data import (
     resolve_trading_sessions,
 )
 from .models import KeyLevel, TradeSetup
-from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview
+from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview, option_market_snapshot
 from .state import (
     CONTEXT_LOCK,
     STATE_LOCK,
@@ -430,14 +432,43 @@ def prepare_daily_context(now_et=None, force=False):
         LOGGER.info("Prepared %s flow sweep setups for session=%s prior_session=%s", len(setups), trading_day, prior_day)
 
 
-def target_level_for_entry(setup, entry_price):
-    if setup.bias.direction == "bullish":
-        candidates = [level for level in setup.resistance_levels if level.price > entry_price]
+def risk_plan_for_entry(option_type, entry_underlying, stop_underlying, target_underlying):
+    if option_type == "CALL":
+        risk_underlying = entry_underlying - stop_underlying
+        reward_underlying = target_underlying - entry_underlying
+        breakeven_trigger_underlying = entry_underlying + risk_underlying * BREAKEVEN_TRIGGER_R_MULTIPLE
+    else:
+        risk_underlying = stop_underlying - entry_underlying
+        reward_underlying = entry_underlying - target_underlying
+        breakeven_trigger_underlying = entry_underlying - risk_underlying * BREAKEVEN_TRIGGER_R_MULTIPLE
+
+    if risk_underlying <= 0 or reward_underlying <= 0:
+        return None
+
+    return {
+        "risk_underlying": round(risk_underlying, 4),
+        "reward_underlying": round(reward_underlying, 4),
+        "target_r_multiple": round(reward_underlying / risk_underlying, 4),
+        "breakeven_trigger_underlying": round(breakeven_trigger_underlying, 4),
+    }
+
+
+def target_level_for_entry(setup, option_type, entry_price, stop_underlying):
+    risk_underlying = entry_price - stop_underlying if option_type == "CALL" else stop_underlying - entry_price
+    if risk_underlying <= 0:
+        return None, None
+
+    if option_type == "CALL":
+        fixed_target = entry_price + risk_underlying * TARGET_R_MULTIPLE
+        candidates = [level for level in setup.resistance_levels if level.price >= fixed_target]
         candidates.sort(key=lambda level: level.price)
     else:
-        candidates = [level for level in setup.support_levels if level.price < entry_price]
+        fixed_target = entry_price - risk_underlying * TARGET_R_MULTIPLE
+        candidates = [level for level in setup.support_levels if level.price <= fixed_target]
         candidates.sort(key=lambda level: level.price, reverse=True)
-    return candidates[0] if candidates else None
+
+    target_level = candidates[0] if candidates else KeyLevel("fixed_2r", fixed_target)
+    return target_level, risk_plan_for_entry(option_type, entry_price, stop_underlying, target_level.price)
 
 
 def swept_level_for_bar(setup, bar):
@@ -463,16 +494,20 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         LOGGER.info("Skipping %s: no usable %s contract preview. status=%s reason=%s", symbol, option_type, contract.get("status"), contract.get("reason"))
         return
 
-    target_level = target_level_for_entry(setup, signal_bar["close"])
-    if not target_level:
-        LOGGER.info("Skipping %s: no target level beyond entry %.2f", symbol, signal_bar["close"])
+    stop_underlying = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
+    target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop_underlying)
+    if not target_level or not risk_plan:
+        LOGGER.info(
+            "Skipping %s: invalid risk distance for entry %.2f stop %.2f",
+            symbol,
+            signal_bar["close"],
+            stop_underlying,
+        )
         return
 
     qty = to_int_qty(contract.get("quantity", 0))
-
-    stop_underlying = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
     LOGGER.info(
-        "ENTER %s %s after %s sweep %.2f close %.2f stop %.2f target %s %.2f: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
+        "ENTER %s %s after %s sweep %.2f close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
         symbol,
         option_type,
         swept_level.name,
@@ -481,6 +516,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         stop_underlying,
         target_level.name,
         target_level.price,
+        risk_plan["target_r_multiple"],
         qty,
         contract["symbol"],
         contract["ask"],
@@ -514,9 +550,17 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             "option_symbol": contract["symbol"],
             "option_type": option_type,
             "entry_underlying": signal_bar["close"],
+            "initial_stop_underlying": stop_underlying,
             "stop_underlying": stop_underlying,
+            "stop_mode": "underlying_sweep_extreme",
             "target_underlying": target_level.price,
             "target_name": target_level.name,
+            "target_exit_method": "market_on_underlying_target",
+            "target_required_r_multiple": TARGET_R_MULTIPLE,
+            **risk_plan,
+            "breakeven_active": False,
+            "breakeven_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
+            "breakeven_stop_option_price": contract.get("ask"),
             "swept_level": swept_level.name,
             "swept_level_price": swept_level.price,
             "entry_order_id": order_id,
@@ -601,6 +645,11 @@ def process_entry_update(symbol, order_id, event, order):
             if filled_qty > 0:
                 position["entry_status"] = event
                 position["total_qty"] = filled_qty
+                filled_avg_price = get_value(order, "filled_avg_price")
+                if filled_avg_price not in (None, ""):
+                    position["entry_option_fill_price"] = float(filled_avg_price)
+                    if not position.get("breakeven_active"):
+                        position["breakeven_stop_option_price"] = float(filled_avg_price)
 
         if event == "fill":
             position["entry_status"] = "filled"
@@ -822,6 +871,53 @@ def process_completed_five_minute_bar(symbol, bar):
         execute_entry(symbol, setup, swept_level, bar)
 
 
+def breakeven_trigger_hit(option_type, minute_bar, trigger_underlying):
+    if trigger_underlying in (None, ""):
+        return False
+    trigger_underlying = float(trigger_underlying)
+    if option_type == "CALL":
+        return minute_bar["high"] >= trigger_underlying
+    return minute_bar["low"] <= trigger_underlying
+
+
+def activate_breakeven_stop(symbol):
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if not position or position.get("breakeven_active"):
+            return
+        position["breakeven_active"] = True
+        position["stop_mode"] = "option_breakeven"
+        position["breakeven_activated_at"] = datetime.now(UTC).isoformat()
+        persist_state_locked()
+    LOGGER.info("%s breakeven stop activated at option price %.2f", symbol, float(position.get("breakeven_stop_option_price") or 0.0))
+
+
+def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
+    if breakeven_price in (None, ""):
+        return False
+    try:
+        snapshot = option_market_snapshot(option_symbol)
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch option snapshot for %s breakeven stop: %s", option_symbol, exc)
+        return False
+
+    market_price = snapshot.get("market_price")
+    if market_price is None:
+        LOGGER.warning("Unable to evaluate breakeven stop for %s: option market price unavailable", option_symbol)
+        return False
+
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if position:
+            position["latest_option_market_price"] = market_price
+            position["latest_option_bid"] = snapshot.get("bid")
+            position["latest_option_ask"] = snapshot.get("ask")
+            position["latest_option_quote_time"] = snapshot.get("quote_time")
+            persist_state_locked()
+
+    return float(market_price) <= float(breakeven_price)
+
+
 def manage_open_position_with_bar(symbol, minute_bar):
     with STATE_LOCK:
         position = active_positions.get(symbol)
@@ -834,6 +930,10 @@ def manage_open_position_with_bar(symbol, minute_bar):
         total_qty = position["total_qty"]
         stop_underlying = float(position["stop_underlying"])
         target_underlying = float(position["target_underlying"])
+        option_symbol = position["option_symbol"]
+        breakeven_active = bool(position.get("breakeven_active"))
+        breakeven_trigger_underlying = position.get("breakeven_trigger_underlying")
+        breakeven_stop_option_price = position.get("breakeven_stop_option_price")
 
     if option_type == "CALL":
         stop_hit = minute_bar["low"] <= stop_underlying
@@ -842,11 +942,20 @@ def manage_open_position_with_bar(symbol, minute_bar):
         stop_hit = minute_bar["high"] >= stop_underlying
         target_hit = minute_bar["low"] <= target_underlying
 
-    if stop_hit:
+    if target_hit:
+        target_r_multiple = float(position.get("target_r_multiple") or 0.0)
+        execute_exit(symbol, total_qty, f"TARGET_{position.get('target_name', 'LEVEL')}_{target_r_multiple:.2f}R")
+        return
+    if not breakeven_active and stop_hit:
         execute_exit(symbol, total_qty, "STOP_SWEEP_EXTREME")
         return
-    if target_hit:
-        execute_exit(symbol, total_qty, f"TARGET_{position.get('target_name', 'LEVEL')}")
+
+    if not breakeven_active and breakeven_trigger_hit(option_type, minute_bar, breakeven_trigger_underlying):
+        activate_breakeven_stop(symbol)
+        breakeven_active = True
+
+    if breakeven_active and option_breakeven_stop_hit(symbol, option_symbol, breakeven_stop_option_price):
+        execute_exit(symbol, total_qty, "STOP_OPTION_BREAKEVEN")
         return
     if minute_bar["timestamp"].time() >= EOD_EXIT_TIME:
         execute_exit(symbol, total_qty, "EOD_EXIT")

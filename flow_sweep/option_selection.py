@@ -1,7 +1,7 @@
 import math
 from datetime import datetime, timedelta
 
-from alpaca.data.requests import OptionBarsRequest, OptionChainRequest
+from alpaca.data.requests import OptionBarsRequest, OptionSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.enums import AssetStatus, ContractType
 from alpaca.trading.requests import GetOptionContractsRequest
@@ -164,6 +164,22 @@ def latest_trade_payload(snapshot):
     }
 
 
+def option_market_snapshot(option_symbol):
+    snapshot = fetch_option_snapshots([option_symbol]).get(option_symbol)
+    if not snapshot:
+        return {"symbol": option_symbol, "market_price": None, "reason": "snapshot unavailable"}
+
+    quote = quote_payload(snapshot)
+    trade = latest_trade_payload(snapshot)
+    market_price = quote.get("bid") or trade.get("last") or quote.get("mid")
+    return {
+        "symbol": option_symbol,
+        "market_price": market_price,
+        **quote,
+        **trade,
+    }
+
+
 def timestamp_text(value):
     if not value:
         return None
@@ -258,6 +274,15 @@ def fetch_recent_option_volumes(option_symbols):
     return volumes
 
 
+def fetch_option_snapshots(option_symbols):
+    snapshots = {}
+    symbols = list(option_symbols)
+    for start in range(0, len(symbols), 100):
+        chunk = symbols[start : start + 100]
+        snapshots.update(raw_option_client.get_option_snapshot(OptionSnapshotRequest(symbol_or_symbols=chunk)))
+    return snapshots
+
+
 def apply_liquidity_checks(candidate):
     warnings = []
     blocking = []
@@ -336,15 +361,13 @@ def best_contract_candidate(symbol, option_type):
         expiration = get_value(contract, "expiration_date")
         by_expiration.setdefault(expiration, []).append(contract)
 
-    contract_type = option_type_enum(option_type)
     for expiration in sorted(by_expiration):
-        raw_chain = raw_option_client.get_option_chain(OptionChainRequest(underlying_symbol=symbol, type=contract_type, expiration_date=expiration))
-        chain = raw_chain.get("snapshots", raw_chain)
         metadata_by_symbol = {get_value(contract, "symbol"): contract for contract in by_expiration[expiration]}
+        snapshots = fetch_option_snapshots(metadata_by_symbol)
         candidates = []
-        for contract_symbol, snapshot in chain.items():
-            contract = metadata_by_symbol.get(contract_symbol)
-            if not contract:
+        for contract_symbol, contract in metadata_by_symbol.items():
+            snapshot = snapshots.get(contract_symbol)
+            if not snapshot:
                 continue
             candidate = candidate_from_snapshot(contract, snapshot, option_type)
             if candidate:

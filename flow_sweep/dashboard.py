@@ -5,6 +5,9 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+from alpaca.trading.requests import GetOrdersRequest
+
+from .clients import trade_client
 from .config import (
     CONSENSUS_THRESHOLD,
     DASHBOARD_ENABLED,
@@ -31,7 +34,7 @@ from .state import (
     pending_entry_orders,
     pending_exit_orders,
 )
-from .utils import round_or_none, to_int_qty
+from .utils import get_value, is_option_asset, normalize_text, round_or_none, to_int_qty
 
 
 def default_decision(symbol):
@@ -56,7 +59,61 @@ def default_decision(symbol):
     }
 
 
-def position_payload(symbol, position):
+def broker_position_payload(position):
+    if not position:
+        return None
+    return {
+        "symbol": normalize_text(get_value(position, "symbol")),
+        "qty": round_or_none(get_value(position, "qty"), 4),
+        "avg_entry_price": round_or_none(get_value(position, "avg_entry_price"), 4),
+        "current_price": round_or_none(get_value(position, "current_price"), 4),
+        "market_value": round_or_none(get_value(position, "market_value"), 2),
+        "cost_basis": round_or_none(get_value(position, "cost_basis"), 2),
+        "unrealized_pl": round_or_none(get_value(position, "unrealized_pl"), 2),
+        "unrealized_plpc": round_or_none(get_value(position, "unrealized_plpc"), 4),
+        "side": normalize_text(get_value(position, "side")),
+    }
+
+
+def order_payload(order):
+    return {
+        "order_id": normalize_text(get_value(order, "id")),
+        "symbol": normalize_text(get_value(order, "symbol")),
+        "side": normalize_text(get_value(order, "side")),
+        "type": normalize_text(get_value(order, "type")),
+        "status": normalize_text(get_value(order, "status")),
+        "qty": round_or_none(get_value(order, "qty"), 4),
+        "filled_qty": round_or_none(get_value(order, "filled_qty"), 4),
+        "limit_price": round_or_none(get_value(order, "limit_price"), 4),
+        "stop_price": round_or_none(get_value(order, "stop_price"), 4),
+        "submitted_at": get_value(order, "submitted_at").isoformat() if get_value(order, "submitted_at") else None,
+    }
+
+
+def fetch_broker_status():
+    try:
+        positions = trade_client.get_all_positions()
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch Alpaca positions for dashboard: %s", exc)
+        positions = []
+
+    try:
+        orders = trade_client.get_orders(filter=GetOrdersRequest(limit=500, nested=False))
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch Alpaca open orders for dashboard: %s", exc)
+        orders = []
+
+    broker_positions = {
+        normalize_text(get_value(position, "symbol")): position
+        for position in positions
+        if is_option_asset(position)
+    }
+    broker_orders = [order_payload(order) for order in orders if is_option_asset(order)]
+    return broker_positions, broker_orders
+
+
+def position_payload(symbol, position, broker_position=None):
+    broker_payload = broker_position_payload(broker_position)
     return {
         "symbol": symbol,
         "managed": bool(position.get("managed", True)),
@@ -69,13 +126,31 @@ def position_payload(symbol, position):
         "stop_underlying": round_or_none(position.get("stop_underlying")),
         "target_underlying": round_or_none(position.get("target_underlying")),
         "target_name": position.get("target_name"),
+        "target_exit_method": position.get("target_exit_method"),
+        "target_required_r_multiple": round_or_none(position.get("target_required_r_multiple"), 2),
+        "target_r_multiple": round_or_none(position.get("target_r_multiple"), 2),
+        "risk_underlying": round_or_none(position.get("risk_underlying")),
+        "reward_underlying": round_or_none(position.get("reward_underlying")),
         "swept_level": position.get("swept_level"),
         "swept_level_price": round_or_none(position.get("swept_level_price")),
+        "initial_stop_underlying": round_or_none(position.get("initial_stop_underlying")),
+        "stop_mode": position.get("stop_mode"),
+        "breakeven_active": bool(position.get("breakeven_active")),
+        "breakeven_trigger_underlying": round_or_none(position.get("breakeven_trigger_underlying")),
+        "breakeven_trigger_r_multiple": round_or_none(position.get("breakeven_trigger_r_multiple"), 2),
+        "breakeven_stop_option_price": round_or_none(position.get("breakeven_stop_option_price"), 4),
+        "breakeven_activated_at": position.get("breakeven_activated_at"),
         "entry_option_delta": round_or_none(position.get("entry_option_delta"), 4),
         "entry_option_gamma": round_or_none(position.get("entry_option_gamma"), 4),
         "entry_option_theta": round_or_none(position.get("entry_option_theta"), 4),
         "entry_option_ask": round_or_none(position.get("entry_option_ask"), 4),
+        "entry_option_fill_price": round_or_none(position.get("entry_option_fill_price"), 4),
         "entry_contract_cost": round_or_none(position.get("entry_contract_cost"), 2),
+        "latest_option_market_price": round_or_none(position.get("latest_option_market_price"), 4),
+        "latest_option_bid": round_or_none(position.get("latest_option_bid"), 4),
+        "latest_option_ask": round_or_none(position.get("latest_option_ask"), 4),
+        "latest_option_quote_time": position.get("latest_option_quote_time"),
+        "broker": broker_payload,
     }
 
 
@@ -112,9 +187,35 @@ def dashboard_status_payload():
 
     now_et = datetime.now(ET)
     display_host = "127.0.0.1" if DASHBOARD_HOST in {"0.0.0.0", "::"} else DASHBOARD_HOST
+    broker_positions, broker_orders = fetch_broker_status()
 
     with STATE_LOCK:
-        active = [position_payload(symbol, position.copy()) for symbol, position in active_positions.items()]
+        active = []
+        matched_broker_symbols = set()
+        for symbol, position in active_positions.items():
+            option_symbol = normalize_text(position.get("option_symbol"))
+            broker_position = broker_positions.get(option_symbol)
+            if broker_position:
+                matched_broker_symbols.add(option_symbol)
+            active.append(position_payload(symbol, position.copy(), broker_position))
+
+        for option_symbol, broker_position in broker_positions.items():
+            if option_symbol in matched_broker_symbols:
+                continue
+            active.append(
+                position_payload(
+                    f"BROKER:{option_symbol}",
+                    {
+                        "managed": False,
+                        "option_symbol": option_symbol,
+                        "option_type": "UNKNOWN",
+                        "entry_status": "broker_open",
+                        "total_qty": get_value(broker_position, "qty", 0),
+                        "requested_qty": get_value(broker_position, "qty", 0),
+                    },
+                    broker_position,
+                )
+            )
         pending_entries = [{"order_id": order_id, "symbol": symbol} for order_id, symbol in pending_entry_orders.items()]
         pending_exits = [pending_exit_payload(order_id, state.copy()) for order_id, state in pending_exit_orders.items()]
         daily_trades = dict(daily_trade_state)
@@ -153,6 +254,7 @@ def dashboard_status_payload():
         "daily_trade_state": daily_trades,
         "decisions": decisions,
         "active_positions": active,
+        "broker_open_orders": broker_orders,
         "pending_entry_orders": pending_entries,
         "pending_exit_orders": pending_exits,
         "recent_5m_bars": sorted(recent_bars, key=lambda item: item.get("symbol") or ""),
@@ -257,6 +359,9 @@ DASHBOARD_HTML = """<!doctype html>
         .contract-value { font-weight: 700; font-variant-numeric: tabular-nums; }
         .contract-note { margin-top: 7px; color: var(--muted); font-size: 12px; }
         .contract-warning { margin-top: 6px; color: var(--warn); font-size: 12px; font-weight: 700; }
+        .pnl-positive { color: var(--bull); font-weight: 700; }
+        .pnl-negative { color: var(--bear); font-weight: 700; }
+        .plan-line { margin-bottom: 3px; }
         .flow-detail-row td { background: color-mix(in srgb, var(--panel) 92%, var(--bg)); padding-top: 0; }
         .flow-details summary { cursor: pointer; color: var(--muted); font-weight: 700; padding: 8px 0; }
         .flow-details[open] summary { color: var(--text); }
@@ -287,6 +392,10 @@ DASHBOARD_HTML = """<!doctype html>
             <div class="wide"><table id="positions"></table></div>
         </section>
         <section>
+            <h2 class="section-title">Broker Open Orders</h2>
+            <div class="wide"><table id="orders"></table></div>
+        </section>
+        <section>
             <h2 class="section-title">Recent 5m Bars</h2>
             <div class="wide"><table id="bars"></table></div>
         </section>
@@ -304,6 +413,39 @@ DASHBOARD_HTML = """<!doctype html>
         function premium(value) { return value == null ? '-' : `$${Number(value).toFixed(2)}`; }
         function fixed(value, digits = 4) { return value == null ? '-' : Number(value).toFixed(digits); }
         function whole(value) { return value == null ? '-' : Number(value).toLocaleString(); }
+        function signedUsd(value) {
+            if (value == null) return '-';
+            const amount = Number(value);
+            const formatted = usd(Math.abs(amount));
+            return amount > 0 ? `+${formatted}` : amount < 0 ? `-${formatted}` : formatted;
+        }
+        function pnlClass(value) {
+            const amount = Number(value || 0);
+            if (amount > 0) return 'pnl-positive';
+            if (amount < 0) return 'pnl-negative';
+            return 'muted';
+        }
+        function brokerPnl(position) {
+            const broker = position.broker;
+            if (!broker) return '<span class="muted">No Alpaca position</span>';
+            return `<span class="${pnlClass(broker.unrealized_pl)}">${signedUsd(broker.unrealized_pl)} / ${pct(broker.unrealized_plpc)}</span><br><span class="muted">Value ${usd(broker.market_value)} / Cost ${usd(broker.cost_basis)}</span>`;
+        }
+        function brokerPosition(position) {
+            const option = `${esc(position.option_symbol || '-')}`;
+            const broker = position.broker;
+            if (!broker) return `${option}<br><span class="muted">${esc(position.option_type || '-')}</span>`;
+            return `${option}<br><span class="muted">Avg ${premium(broker.avg_entry_price)} / Mark ${premium(broker.current_price)}</span>`;
+        }
+        function stopPlan(position) {
+            const active = position.breakeven_active;
+            const stopLine = active ? `BE option ${premium(position.breakeven_stop_option_price)}` : `Underlying ${px(position.stop_underlying)}`;
+            const trigger = position.breakeven_trigger_underlying == null ? '-' : `${px(position.breakeven_trigger_underlying)} (${fixed(position.breakeven_trigger_r_multiple || 1.5, 1)}R)`;
+            return `<div class="plan-line"><strong>${esc(stopLine)}</strong></div><div class="muted">Initial ${px(position.initial_stop_underlying || position.stop_underlying)} / BE trigger ${trigger}</div>`;
+        }
+        function targetPlan(position) {
+            const target = position.target_underlying == null ? '-' : `${px(position.target_underlying)}${position.target_name ? ` (${esc(position.target_name)})` : ''}`;
+            return `<div class="plan-line"><strong>${target}</strong></div><div class="muted">${fixed(position.target_r_multiple, 2)}R / ${esc(position.target_exit_method || 'bot-managed')}</div>`;
+        }
         function expiry(value) {
             if (!value) return '-';
             const parts = String(value).split('-').map(Number);
@@ -423,7 +565,7 @@ DASHBOARD_HTML = """<!doctype html>
         function table(elementId, headers, rows, emptyText) {
             const el = document.getElementById(elementId);
             if (!rows.length) {
-                el.innerHTML = `<tbody><tr><td class="muted">${esc(emptyText)}</td></tr></tbody>`;
+                el.innerHTML = `<thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody><tr><td class="muted" colspan="${headers.length}">${esc(emptyText)}</td></tr></tbody>`;
                 return;
             }
             el.innerHTML = `<thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody>`;
@@ -449,6 +591,7 @@ DASHBOARD_HTML = """<!doctype html>
                 metric('High-Score Flow Rows', data.daily_context.high_score_flow_count || 0),
                 metric('Active Positions', data.active_positions.length),
                 metric('Pending Orders', data.pending_entry_orders.length + data.pending_exit_orders.length),
+                metric('Broker Orders', data.broker_open_orders.length),
                 metric('Account Balance', usd(data.daily_context.account && data.daily_context.account.account_balance)),
                 metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% balance`)
             ].join('');
@@ -465,14 +608,23 @@ DASHBOARD_HTML = """<!doctype html>
                 </tr>`;
                 return [mainRow, flowDetails(d)];
             }), 'No decisions prepared yet.');
-            table('positions', ['Symbol', 'Option', 'Qty', 'Stop', 'Target', 'Status'], data.active_positions.map(p => `<tr>
+            table('positions', ['Symbol', 'Broker Position', 'Alpaca PnL', 'Qty', 'Stop Plan', 'Take Profit', 'Status'], data.active_positions.map(p => `<tr>
                 <td class="symbol">${esc(p.symbol)}</td>
-                <td>${esc(p.option_symbol || '-')}<br><span class="muted">${esc(p.option_type || '-')}</span></td>
-                <td>${esc(p.total_qty)} / ${esc(p.requested_qty)}</td>
-                <td>${px(p.stop_underlying)}</td>
-                <td>${esc(p.target_name || '-')} ${px(p.target_underlying)}</td>
+                <td>${brokerPosition(p)}</td>
+                <td>${brokerPnl(p)}</td>
+                <td>${esc(p.total_qty)} / ${esc(p.requested_qty)}<br><span class="muted">Broker ${esc(p.broker && p.broker.qty != null ? p.broker.qty : '-')}</span></td>
+                <td>${stopPlan(p)}</td>
+                <td>${targetPlan(p)}</td>
                 <td>${esc(p.entry_status || '-')}<br><span class="muted">Swept ${esc(p.swept_level || '-')}</span></td>
             </tr>`), 'No active positions.');
+            table('orders', ['Symbol', 'Side', 'Type', 'Qty', 'Status', 'Limit / Stop'], data.broker_open_orders.map(o => `<tr>
+                <td class="symbol">${esc(o.symbol || '-')}</td>
+                <td>${esc(o.side || '-')}</td>
+                <td>${esc(o.type || '-')}</td>
+                <td>${esc(o.filled_qty ?? 0)} / ${esc(o.qty ?? '-')}</td>
+                <td>${esc(o.status || '-')}</td>
+                <td>${premium(o.limit_price)} / ${premium(o.stop_price)}</td>
+            </tr>`), 'No broker open option orders.');
             table('bars', ['Symbol', 'Close Time', 'O/H/L/C', 'Volume'], data.recent_5m_bars.map(b => `<tr>
                 <td class="symbol">${esc(b.symbol)}</td>
                 <td>${b.close_time ? esc(new Date(b.close_time).toLocaleTimeString()) : '-'}</td>
