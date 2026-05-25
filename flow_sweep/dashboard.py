@@ -1,7 +1,7 @@
+import csv
 import json
 import threading
 import time
-import csv
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -508,7 +508,7 @@ DASHBOARD_HTML = """<!doctype html>
         .section-title { margin: 8px 0 6px; font-size: 18px; }
         .wide { overflow-x: auto; }
         @media (max-width: 980px) { .grid, .backtest-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-        @media (max-width: 640px) { header, main { padding-left: 12px; padding-right: 12px; } .grid { grid-template-columns: 1fr; } th, td { padding: 8px 6px; } }
+        @media (max-width: 640px) { header, main { padding-left: 12px; padding-right: 12px; } .grid, .backtest-summary { grid-template-columns: 1fr; } th, td { padding: 8px 6px; } }
     </style>
 </head>
 <body>
@@ -556,6 +556,7 @@ DASHBOARD_HTML = """<!doctype html>
         const money = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
         const price = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const expandedFlowSymbols = new Set();
+        let backtestVisible = false;
         function esc(value) {
             return String(value ?? '').replace(/[&<>'"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[c]));
         }
@@ -764,6 +765,63 @@ DASHBOARD_HTML = """<!doctype html>
         function metric(label, value) {
             return `<div class="panel"><div class="metric">${esc(label)}</div><div class="metric-value">${esc(value)}</div></div>`;
         }
+        function summaryCard(label, value) {
+            return `<div class="backtest-card"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`;
+        }
+        function profitFactor(value) {
+            if (value == null) return '-';
+            return Number(value).toFixed(2);
+        }
+        function renderBacktest(payload) {
+            const panel = document.getElementById('backtest-panel');
+            if (!payload.available) {
+                panel.innerHTML = `<span class="muted">${esc(payload.reason || 'No backtest output is available.')}</span>`;
+                return;
+            }
+            const summary = payload.summary || {};
+            const rows = payload.trade_rows || [];
+            const tradeRows = rows.slice(0, 20).map(row => `<tr>
+                <td>${esc(row.session || '-')}</td>
+                <td class="symbol">${esc(row.symbol || '-')}</td>
+                <td>${esc(row.direction || '-')} ${esc(row.option_type || '')}</td>
+                <td>${esc(row.entry_time || '-')}<br><span class="muted">${px(row.entry_price)}</span></td>
+                <td>${esc(row.exit_reason || '-')}<br><span class="muted">${px(row.exit_price)}</span></td>
+                <td>${fixed(row.r_multiple, 2)}</td>
+                <td>${esc(row.target_name || '-')} ${px(row.target_price)}</td>
+            </tr>`).join('');
+            const tableHtml = rows.length ? `<table><thead><tr><th>Session</th><th>Symbol</th><th>Bias</th><th>Entry</th><th>Exit</th><th>R</th><th>Target</th></tr></thead><tbody>${tradeRows}</tbody></table>` : '<span class="muted">No trade rows found in the latest backtest.</span>';
+            panel.innerHTML = `
+                <div class="muted">Latest: ${esc(payload.markdown_file || '-')} / updated ${shortDateTime(payload.updated_at)}</div>
+                <div class="backtest-summary">
+                    ${summaryCard('Trades', summary.trades ?? 0)}
+                    ${summaryCard('Win Rate', pct(summary.win_rate))}
+                    ${summaryCard('Profit Factor', profitFactor(summary.profit_factor))}
+                    ${summaryCard('Total R', fixed(summary.total_r, 2))}
+                    ${summaryCard('Avg R', fixed(summary.avg_r, 2))}
+                    ${summaryCard('W/L/BE', `${summary.wins ?? 0}/${summary.losses ?? 0}/${summary.breakeven ?? 0}`)}
+                </div>
+                <div class="wide">${tableHtml}</div>
+                <h2 class="section-title">Backtest Log</h2>
+                <pre class="backtest-markdown">${esc(payload.markdown || '')}</pre>
+            `;
+        }
+        async function loadBacktest() {
+            const panel = document.getElementById('backtest-panel');
+            panel.innerHTML = '<span class="muted">Loading latest backtest...</span>';
+            const response = await fetch('/api/backtest/latest', { cache: 'no-store' });
+            renderBacktest(await response.json());
+        }
+        async function toggleBacktest() {
+            backtestVisible = !backtestVisible;
+            const section = document.getElementById('backtest-section');
+            const button = document.getElementById('backtest-button');
+            section.classList.toggle('hidden', !backtestVisible);
+            button.classList.toggle('active', backtestVisible);
+            if (backtestVisible) {
+                await loadBacktest();
+                section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        }
         async function refresh() {
             const response = await fetch('/api/status', { cache: 'no-store' });
             const data = await response.json();
@@ -857,6 +915,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             payload = dashboard_status_payload()
+            body = json.dumps(payload, default=str).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/backtest/latest":
+            payload = latest_backtest_payload()
             body = json.dumps(payload, default=str).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
