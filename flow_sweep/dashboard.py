@@ -90,18 +90,74 @@ def order_payload(order):
     }
 
 
+def account_payload(account):
+    if not account:
+        return {}
+    account_number = normalize_text(get_value(account, "account_number"))
+    return {
+        "status": normalize_text(get_value(account, "status")),
+        "currency": normalize_text(get_value(account, "currency")),
+        "account_last4": account_number[-4:] if account_number else None,
+        "portfolio_value": round_or_none(get_value(account, "portfolio_value"), 2),
+        "equity": round_or_none(get_value(account, "equity"), 2),
+        "cash": round_or_none(get_value(account, "cash"), 2),
+        "buying_power": round_or_none(get_value(account, "buying_power"), 2),
+        "regt_buying_power": round_or_none(get_value(account, "regt_buying_power"), 2),
+        "daytrading_buying_power": round_or_none(get_value(account, "daytrading_buying_power"), 2),
+        "non_marginable_buying_power": round_or_none(get_value(account, "non_marginable_buying_power"), 2),
+        "options_buying_power": round_or_none(get_value(account, "options_buying_power"), 2),
+        "multiplier": round_or_none(get_value(account, "multiplier"), 2),
+        "pattern_day_trader": bool(get_value(account, "pattern_day_trader", False)),
+        "trading_blocked": bool(get_value(account, "trading_blocked", False)),
+        "transfers_blocked": bool(get_value(account, "transfers_blocked", False)),
+        "account_blocked": bool(get_value(account, "account_blocked", False)),
+        "trade_suspended_by_user": bool(get_value(account, "trade_suspended_by_user", False)),
+    }
+
+
+def clock_payload(clock):
+    if not clock:
+        return {}
+    timestamp = get_value(clock, "timestamp")
+    next_open = get_value(clock, "next_open")
+    next_close = get_value(clock, "next_close")
+    return {
+        "is_open": bool(get_value(clock, "is_open", False)),
+        "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat") else normalize_text(timestamp),
+        "next_open": next_open.isoformat() if hasattr(next_open, "isoformat") else normalize_text(next_open),
+        "next_close": next_close.isoformat() if hasattr(next_close, "isoformat") else normalize_text(next_close),
+    }
+
+
 def fetch_broker_status():
+    errors = []
     try:
         positions = trade_client.get_all_positions()
     except Exception as exc:
         LOGGER.warning("Unable to fetch Alpaca positions for dashboard: %s", exc)
+        errors.append(f"positions: {exc}")
         positions = []
 
     try:
         orders = trade_client.get_orders(filter=GetOrdersRequest(limit=500, nested=False))
     except Exception as exc:
         LOGGER.warning("Unable to fetch Alpaca open orders for dashboard: %s", exc)
+        errors.append(f"orders: {exc}")
         orders = []
+
+    try:
+        account = trade_client.get_account()
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch Alpaca account for dashboard: %s", exc)
+        errors.append(f"account: {exc}")
+        account = None
+
+    try:
+        clock = trade_client.get_clock()
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch Alpaca clock for dashboard: %s", exc)
+        errors.append(f"clock: {exc}")
+        clock = None
 
     broker_positions = {
         normalize_text(get_value(position, "symbol")): position
@@ -109,7 +165,7 @@ def fetch_broker_status():
         if is_option_asset(position)
     }
     broker_orders = [order_payload(order) for order in orders if is_option_asset(order)]
-    return broker_positions, broker_orders
+    return broker_positions, broker_orders, account_payload(account), clock_payload(clock), errors
 
 
 def position_payload(symbol, position, broker_position=None):
@@ -188,7 +244,7 @@ def dashboard_status_payload():
 
     now_et = datetime.now(ET)
     display_host = "127.0.0.1" if DASHBOARD_HOST in {"0.0.0.0", "::"} else DASHBOARD_HOST
-    broker_positions, broker_orders = fetch_broker_status()
+    broker_positions, broker_orders, broker_account, broker_clock, broker_errors = fetch_broker_status()
 
     with STATE_LOCK:
         active = []
@@ -220,6 +276,7 @@ def dashboard_status_payload():
         pending_entries = [{"order_id": order_id, "symbol": symbol} for order_id, symbol in pending_entry_orders.items()]
         pending_exits = [pending_exit_payload(order_id, state.copy()) for order_id, state in pending_exit_orders.items()]
         daily_trades = dict(daily_trade_state)
+        daily_trades["events"] = list(daily_trade_state.get("events", []))
 
     with CONTEXT_LOCK:
         decisions_by_symbol = dict(daily_context.get("decisions") or {})
@@ -256,6 +313,9 @@ def dashboard_status_payload():
         "daily_trade_state": daily_trades,
         "decisions": decisions,
         "active_positions": active,
+        "broker_account": broker_account,
+        "broker_clock": broker_clock,
+        "broker_errors": broker_errors,
         "broker_open_orders": broker_orders,
         "pending_entry_orders": pending_entries,
         "pending_exit_orders": pending_exits,
@@ -364,6 +424,9 @@ DASHBOARD_HTML = """<!doctype html>
         .pnl-positive { color: var(--bull); font-weight: 700; }
         .pnl-negative { color: var(--bear); font-weight: 700; }
         .plan-line { margin-bottom: 3px; }
+        .ok { color: var(--bull); font-weight: 700; }
+        .warn { color: var(--warn); font-weight: 700; }
+        .event-type { font-weight: 700; white-space: nowrap; }
         .flow-detail-row td { background: color-mix(in srgb, var(--panel) 92%, var(--bg)); padding-top: 0; }
         .flow-details summary { cursor: pointer; color: var(--muted); font-weight: 700; padding: 8px 0; }
         .flow-details[open] summary { color: var(--text); }
@@ -386,6 +449,10 @@ DASHBOARD_HTML = """<!doctype html>
     <main>
         <section class="grid" id="metrics"></section>
         <section>
+            <h2 class="section-title">Alpaca Snapshot</h2>
+            <div class="wide"><table id="alpaca"></table></div>
+        </section>
+        <section>
             <h2 class="section-title">Decision Board</h2>
             <div class="wide"><table id="decisions"></table></div>
         </section>
@@ -400,6 +467,10 @@ DASHBOARD_HTML = """<!doctype html>
         <section>
             <h2 class="section-title">Recent 5m Bars</h2>
             <div class="wide"><table id="bars"></table></div>
+        </section>
+        <section>
+            <h2 class="section-title">Daily Trade Log</h2>
+            <div class="wide"><table id="trade-log"></table></div>
         </section>
     </main>
     <script>
@@ -447,6 +518,42 @@ DASHBOARD_HTML = """<!doctype html>
         function targetPlan(position) {
             const target = position.target_underlying == null ? '-' : `${px(position.target_underlying)}${position.target_name ? ` (${esc(position.target_name)})` : ''}`;
             return `<div class="plan-line"><strong>${target}</strong></div><div class="muted">${fixed(position.target_r_multiple, 2)}R / ${esc(position.target_exit_method || 'bot-managed')}</div>`;
+        }
+        function yesNo(value) { return value ? 'Yes' : 'No'; }
+        function boolClass(value) { return value ? 'warn' : 'ok'; }
+        function alpacaStatusRows(data) {
+            const account = data.broker_account || {};
+            const clock = data.broker_clock || {};
+            const errors = data.broker_errors || [];
+            const blockFlags = [
+                account.trading_blocked && 'Trading blocked',
+                account.account_blocked && 'Account blocked',
+                account.transfers_blocked && 'Transfers blocked',
+                account.trade_suspended_by_user && 'User suspended'
+            ].filter(Boolean);
+            return [
+                `<tr><td>Market Clock</td><td><span class="${clock.is_open ? 'ok' : 'muted'}">${clock.is_open ? 'Open' : 'Closed'}</span></td><td>Next open ${shortDateTime(clock.next_open)} / next close ${shortDateTime(clock.next_close)}</td></tr>`,
+                `<tr><td>Account</td><td>${esc(account.status || '-')}</td><td>${account.account_last4 ? `Acct ${esc(account.account_last4)} / ` : ''}${esc(account.currency || 'USD')} / PDT ${yesNo(account.pattern_day_trader)}</td></tr>`,
+                `<tr><td>Equity</td><td>${usd(account.portfolio_value)}</td><td>Equity ${usd(account.equity)} / Cash ${usd(account.cash)}</td></tr>`,
+                `<tr><td>Buying Power</td><td>${usd(account.buying_power)}</td><td>Day ${usd(account.daytrading_buying_power)} / RegT ${usd(account.regt_buying_power)} / Options ${usd(account.options_buying_power)}</td></tr>`,
+                `<tr><td>Blocks</td><td><span class="${boolClass(blockFlags.length)}">${blockFlags.length ? 'Check' : 'Clear'}</span></td><td>${blockFlags.length ? esc(blockFlags.join(' / ')) : 'No account or trading blocks reported'}</td></tr>`,
+                `<tr><td>Dashboard Pull</td><td><span class="${boolClass(errors.length)}">${errors.length ? 'Warnings' : 'OK'}</span></td><td>${errors.length ? esc(errors.join(' / ')) : 'Positions, orders, account, and clock loaded'}</td></tr>`
+            ];
+        }
+        function eventDetails(event) {
+            const parts = [];
+            if (event.reason) parts.push(event.reason);
+            if (event.status) parts.push(`Status ${event.status}`);
+            if (event.order_id) parts.push(`Order ${event.order_id}`);
+            if (event.side) parts.push(`Side ${event.side}`);
+            if (event.order_type) parts.push(`Type ${event.order_type}`);
+            if (event.target_name) parts.push(`Target ${event.target_name} ${px(event.target_underlying)}`);
+            if (event.target_r_multiple != null) parts.push(`${fixed(event.target_r_multiple, 2)}R`);
+            if (event.stop_underlying != null) parts.push(`Stop ${px(event.stop_underlying)}`);
+            if (event.blocking && event.blocking.length) parts.push(`Blocking ${event.blocking.join(' / ')}`);
+            if (event.warnings && event.warnings.length) parts.push(`Warnings ${event.warnings.join(' / ')}`);
+            if (event.error) parts.push(`Error ${event.error}`);
+            return parts.length ? esc(parts.join(' / ')) : '-';
         }
         function expiry(value) {
             if (!value) return '-';
@@ -599,8 +706,10 @@ DASHBOARD_HTML = """<!doctype html>
                 metric('Pending Orders', data.pending_entry_orders.length + data.pending_exit_orders.length),
                 metric('Broker Orders', data.broker_open_orders.length),
                 metric('Account Balance', usd(data.daily_context.account && data.daily_context.account.account_balance)),
-                metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% balance`)
+                metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% balance`),
+                metric('Trade Events', (data.daily_trade_state.events || []).length)
             ].join('');
+            table('alpaca', ['Area', 'Status', 'Details'], alpacaStatusRows(data), 'Alpaca account and clock details unavailable.');
             table('decisions', ['Symbol', 'Decision', 'Consensus', 'Key Levels', 'Planned Contract', 'Targets', 'Reason'], data.decisions.flatMap(d => {
                 const directionClass = d.direction === 'bullish' ? 'bullish' : d.direction === 'bearish' ? 'bearish' : 'neutral';
                 const mainRow = `<tr>
@@ -637,6 +746,16 @@ DASHBOARD_HTML = """<!doctype html>
                 <td>${px(b.open)} / ${px(b.high)} / ${px(b.low)} / ${px(b.close)}</td>
                 <td>${esc(b.volume ?? '-')}</td>
             </tr>`), 'No completed 5-minute bars yet.');
+            const events = (data.daily_trade_state.events || []).slice().reverse();
+            table('trade-log', ['Time', 'Event', 'Symbol', 'Contract', 'Qty', 'Price', 'Details'], events.map(event => `<tr>
+                <td>${shortDateTime(event.timestamp)}</td>
+                <td class="event-type">${esc(event.event_type || '-')}</td>
+                <td class="symbol">${esc(event.symbol || '-')}</td>
+                <td>${esc(event.option_symbol || '-')}<br><span class="muted">${esc(event.option_type || '')}</span></td>
+                <td>${esc(event.qty ?? event.filled_qty ?? '-')}</td>
+                <td>${premium(event.filled_avg_price ?? event.ask ?? event.breakeven_stop_option_price)}</td>
+                <td>${eventDetails(event)}</td>
+            </tr>`), 'No trade events logged for this session.');
         }
         refresh().catch(console.error);
         setInterval(() => refresh().catch(console.error), 5000);

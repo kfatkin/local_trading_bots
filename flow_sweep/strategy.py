@@ -51,6 +51,8 @@ from .state import (
     pending_entry_orders,
     pending_exit_orders,
     persist_state_locked,
+    record_trade_event,
+    record_trade_event_locked,
     reset_daily_trade_state_if_needed,
     reserved_exit_qty,
     was_symbol_traded_today,
@@ -515,6 +517,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         if symbol in active_positions or symbol in pending_entry_orders.values():
             return
     if was_symbol_traded_today(symbol):
+        record_trade_event("entry_skipped", symbol=symbol, event_id=f"entry-skipped-already-traded:{symbol}", reason="symbol already traded today")
         return
 
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
@@ -524,9 +527,26 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
     publish_contract_preview(symbol, contract, "entry_preflight")
     if not preflight.get("ok"):
         LOGGER.warning("Skipping %s: Alpaca entry preflight failed: %s", symbol, "; ".join(preflight.get("blocking") or []))
+        record_trade_event(
+            "entry_blocked",
+            symbol=symbol,
+            option_symbol=contract.get("symbol"),
+            option_type=option_type,
+            reason="Alpaca entry preflight failed",
+            blocking=preflight.get("blocking"),
+            warnings=preflight.get("warnings"),
+        )
         return
     if contract.get("status") != "ready" or contract.get("quantity", 0) < 1:
         LOGGER.info("Skipping %s: no usable %s contract preview. status=%s reason=%s", symbol, option_type, contract.get("status"), contract.get("reason"))
+        record_trade_event(
+            "entry_skipped",
+            symbol=symbol,
+            option_symbol=contract.get("symbol"),
+            option_type=option_type,
+            reason=contract.get("reason"),
+            status=contract.get("status"),
+        )
         return
 
     stop_underlying = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
@@ -537,6 +557,15 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             symbol,
             signal_bar["close"],
             stop_underlying,
+        )
+        record_trade_event(
+            "entry_skipped",
+            symbol=symbol,
+            option_symbol=contract.get("symbol"),
+            option_type=option_type,
+            reason="invalid risk distance",
+            entry_underlying=signal_bar["close"],
+            stop_underlying=stop_underlying,
         )
         return
 
@@ -574,6 +603,14 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         order = trade_client.submit_order(order_data=req)
     except Exception as exc:
         LOGGER.error("Entry order failed for %s: %s", symbol, exc)
+        record_trade_event(
+            "entry_error",
+            symbol=symbol,
+            option_symbol=contract["symbol"],
+            option_type=option_type,
+            qty=qty,
+            reason=str(exc),
+        )
         return
 
     order_id = str(order.id)
@@ -613,6 +650,27 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             "entry_submitted_at": datetime.now(UTC).isoformat(),
         }
         mark_symbol_traded(symbol)
+        record_trade_event_locked(
+            "entry_submitted",
+            symbol=symbol,
+            event_id=f"entry-submitted:{order_id}",
+            order_id=order_id,
+            option_symbol=contract["symbol"],
+            option_type=option_type,
+            qty=qty,
+            side="buy",
+            order_type="market",
+            entry_underlying=signal_bar["close"],
+            stop_underlying=stop_underlying,
+            target_underlying=target_level.price,
+            target_name=target_level.name,
+            target_r_multiple=risk_plan.get("target_r_multiple"),
+            swept_level=swept_level.name,
+            swept_level_price=swept_level.price,
+            ask=contract.get("ask"),
+            delta=contract.get("delta"),
+            preflight_ok=preflight.get("ok"),
+        )
         persist_state_locked()
 
     LOGGER.info("Submitted entry order %s for %sx %s", order_id, qty, contract["symbol"])
@@ -642,11 +700,31 @@ def execute_exit(symbol, exit_qty, reason):
         order = trade_client.submit_order(order_data=req)
     except Exception as exc:
         LOGGER.error("Exit order failed for %s: %s", symbol, exc)
+        record_trade_event(
+            "exit_error",
+            symbol=symbol,
+            option_symbol=option_symbol,
+            qty=exit_qty,
+            side="sell",
+            reason=reason,
+            error=str(exc),
+        )
         return False
 
     order_id = str(order.id)
     with STATE_LOCK:
         pending_exit_orders[order_id] = {"symbol": symbol, "qty": exit_qty, "filled_qty": 0, "reason": reason}
+        record_trade_event_locked(
+            "exit_submitted",
+            symbol=symbol,
+            event_id=f"exit-submitted:{order_id}",
+            order_id=order_id,
+            option_symbol=option_symbol,
+            qty=exit_qty,
+            side="sell",
+            order_type="market",
+            reason=reason,
+        )
         persist_state_locked()
 
     LOGGER.info("Submitted exit order %s for %s", order_id, symbol)
@@ -686,12 +764,32 @@ def process_entry_update(symbol, order_id, event, order):
                     position["entry_option_fill_price"] = float(filled_avg_price)
                     if not position.get("breakeven_active"):
                         position["breakeven_stop_option_price"] = float(filled_avg_price)
+                record_trade_event_locked(
+                    "entry_fill",
+                    symbol=symbol,
+                    event_id=f"entry-fill:{order_id}:{event}:{filled_qty}",
+                    order_id=order_id,
+                    option_symbol=position.get("option_symbol"),
+                    qty=filled_qty,
+                    filled_avg_price=get_value(order, "filled_avg_price"),
+                    status=get_value(order, "status"),
+                    event=event,
+                )
 
         if event == "fill":
             position["entry_status"] = "filled"
             pending_entry_orders.pop(order_id, None)
 
         if event in {"canceled", "expired", "rejected"}:
+            record_trade_event_locked(
+                "entry_order_closed",
+                symbol=symbol,
+                event_id=f"entry-closed:{order_id}:{event}",
+                order_id=order_id,
+                option_symbol=position.get("option_symbol"),
+                status=get_value(order, "status"),
+                event=event,
+            )
             pending_entry_orders.pop(order_id, None)
             if position.get("total_qty", 0) <= 0:
                 active_positions.pop(symbol, None)
@@ -711,13 +809,38 @@ def process_exit_update(order_id, event, order, order_state):
         filled_qty = to_int_qty(get_value(order, "filled_qty", order_state["filled_qty"]))
         filled_delta = max(filled_qty - order_state["filled_qty"], 0)
         if filled_delta > 0:
+            option_symbol = position.get("option_symbol")
             position["total_qty"] = max(position["total_qty"] - filled_delta, 0)
             order_state["filled_qty"] = filled_qty
+            record_trade_event_locked(
+                "exit_fill",
+                symbol=symbol,
+                event_id=f"exit-fill:{order_id}:{event}:{filled_qty}",
+                order_id=order_id,
+                option_symbol=option_symbol,
+                qty=filled_delta,
+                filled_qty=filled_qty,
+                remaining_qty=position["total_qty"],
+                filled_avg_price=get_value(order, "filled_avg_price"),
+                reason=order_state.get("reason"),
+                status=get_value(order, "status"),
+                event=event,
+            )
 
         if position["total_qty"] <= 0:
             active_positions.pop(symbol, None)
 
         if event in {"fill", "canceled", "expired", "rejected"}:
+            record_trade_event_locked(
+                "exit_order_closed",
+                symbol=symbol,
+                event_id=f"exit-closed:{order_id}:{event}",
+                order_id=order_id,
+                option_symbol=get_value(order, "symbol"),
+                status=get_value(order, "status"),
+                reason=order_state.get("reason"),
+                event=event,
+            )
             pending_exit_orders.pop(order_id, None)
 
         persist_state_locked()
@@ -763,6 +886,14 @@ def add_unmanaged_position(option_symbol, quantity):
             "entry_order_id": None,
             "entry_status": "filled",
         }
+        record_trade_event_locked(
+            "broker_unmanaged_position",
+            symbol=placeholder_key,
+            event_id=f"broker-unmanaged:{option_symbol}",
+            option_symbol=option_symbol,
+            qty=quantity,
+            reason="Alpaca position found without matching local strategy state",
+        )
         persist_state_locked()
 
 
@@ -808,6 +939,13 @@ def reconcile_state():
         if not has_pending_entry:
             LOGGER.warning("Dropping stale local position for %s because Alpaca has no open option position.", symbol)
             with STATE_LOCK:
+                record_trade_event_locked(
+                    "reconcile_dropped_position",
+                    symbol=symbol,
+                    event_id=f"reconcile-dropped:{symbol}:{position.get('option_symbol')}",
+                    option_symbol=position.get("option_symbol"),
+                    reason="Alpaca has no open option position",
+                )
                 active_positions.pop(symbol, None)
                 persist_state_locked()
 
@@ -924,6 +1062,14 @@ def activate_breakeven_stop(symbol):
         position["breakeven_active"] = True
         position["stop_mode"] = "option_breakeven"
         position["breakeven_activated_at"] = datetime.now(UTC).isoformat()
+        record_trade_event_locked(
+            "breakeven_activated",
+            symbol=symbol,
+            event_id=f"breakeven:{symbol}:{position.get('breakeven_activated_at')}",
+            option_symbol=position.get("option_symbol"),
+            breakeven_stop_option_price=position.get("breakeven_stop_option_price"),
+            breakeven_trigger_underlying=position.get("breakeven_trigger_underlying"),
+        )
         persist_state_locked()
     LOGGER.info("%s breakeven stop activated at option price %.2f", symbol, float(position.get("breakeven_stop_option_price") or 0.0))
 

@@ -1,8 +1,10 @@
 import json
 import os
 import threading
+from datetime import datetime
+from decimal import Decimal
 
-from .config import LOGGER, STATE_FILE_PATH, ensure_runtime_dir
+from .config import ET, LOGGER, STATE_FILE_PATH, TRADE_EVENT_LOG_LIMIT, ensure_runtime_dir
 
 
 STATE_LOCK = threading.RLock()
@@ -11,7 +13,7 @@ CONTEXT_LOCK = threading.RLock()
 active_positions = {}
 pending_entry_orders = {}
 pending_exit_orders = {}
-daily_trade_state = {"session": None, "traded_symbols": []}
+daily_trade_state = {"session": None, "traded_symbols": [], "events": []}
 
 daily_context = {
     "session": None,
@@ -68,8 +70,9 @@ def load_state_from_disk():
         pending_exit_orders.clear()
         pending_exit_orders.update(snapshot.get("pending_exit_orders", {}))
         daily_trade_state.clear()
-        daily_trade_state.update(snapshot.get("daily_trade_state", {"session": None, "traded_symbols": []}))
+        daily_trade_state.update(snapshot.get("daily_trade_state", {"session": None, "traded_symbols": [], "events": []}))
         daily_trade_state.setdefault("traded_symbols", [])
+        daily_trade_state.setdefault("events", [])
 
     LOGGER.info(
         "Loaded local state: active_positions=%s pending_entry_orders=%s pending_exit_orders=%s traded_symbols=%s",
@@ -87,6 +90,7 @@ def reset_daily_trade_state_if_needed(session_date):
             return
         daily_trade_state["session"] = session_key
         daily_trade_state["traded_symbols"] = []
+        daily_trade_state["events"] = []
         persist_state_locked()
 
 
@@ -101,6 +105,45 @@ def mark_symbol_traded(symbol):
 def was_symbol_traded_today(symbol):
     with STATE_LOCK:
         return symbol in set(daily_trade_state.get("traded_symbols", []))
+
+
+def json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def record_trade_event_locked(event_type, symbol=None, event_id=None, **fields):
+    events = daily_trade_state.setdefault("events", [])
+    if event_id and any(event.get("event_id") == event_id for event in events):
+        return
+
+    event = {
+        "timestamp": datetime.now(ET).isoformat(),
+        "event_type": event_type,
+    }
+    if symbol:
+        event["symbol"] = symbol
+    if event_id:
+        event["event_id"] = event_id
+    event.update({key: json_safe(value) for key, value in fields.items() if value is not None})
+    events.append(event)
+    if len(events) > TRADE_EVENT_LOG_LIMIT:
+        del events[: len(events) - TRADE_EVENT_LOG_LIMIT]
+
+
+def record_trade_event(event_type, symbol=None, event_id=None, **fields):
+    with STATE_LOCK:
+        record_trade_event_locked(event_type, symbol=symbol, event_id=event_id, **fields)
+        persist_state_locked()
 
 
 def reserved_exit_qty(symbol):
