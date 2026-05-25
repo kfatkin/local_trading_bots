@@ -52,7 +52,28 @@ STATE_FILE_PATH = RUNTIME_DIR / "state.json"
 LOG_FILE_PATH = RUNTIME_DIR / "flow-sweep-bot.log"
 
 CLIENT_ORDER_PREFIX = os.getenv("CLIENT_ORDER_PREFIX", "fsw")
-SYMBOLS = ["AMD", "AAPL", "AMZN", "GOOGL", "META", "MU", "INTC", "NVDA", "TSLA", "STX", "SNDK"]
+SYMBOLS = [
+    "AMD",
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "MU",
+    "INTC",
+    "NVDA",
+    "TSLA",
+    "STX",
+    "SNDK",
+    "MSFT",
+    "TSM",
+    "WDC",
+    "LITE",
+    "DELL",
+    "GLW",
+    "VRT",
+    "APLD",
+    "IREN",
+]
 
 MIN_FLOW_SCORE = env_int("FLOW_SWEEP_MIN_SCORE", 70)
 CONSENSUS_THRESHOLD = env_float("FLOW_SWEEP_CONSENSUS_THRESHOLD", 0.70)

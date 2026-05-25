@@ -9,14 +9,25 @@ The bot watches:
 - `AMD`
 - `AAPL`
 - `AMZN`
+- `APLD`
+- `DELL`
+- `GLW`
 - `GOOGL`
+- `IREN`
 - `META`
+- `LITE`
+- `MSFT`
 - `MU`
 - `INTC`
 - `NVDA`
 - `TSLA`
+- `TSM`
+- `VRT`
+- `WDC`
 - `STX`
 - `SNDK`
+
+Requested additions were screened through the bot's current options contract-preview logic before being added. `CIEN`, `COHR`, `GNRC`, and `ON` were left out because their selected nearest-expiration contracts came back with weaker liquidity than the rest of the group.
 
 Before the trading session, it queries the `uw-data` DynamoDB table with AWS profile `trading_bot` and looks for `_flow_scores_trading_bot` rows from the prior NYSE regular session where `composite_score > 70`.
 
