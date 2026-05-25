@@ -1,12 +1,11 @@
-import math
 import time
+import threading
 from datetime import datetime, timedelta
 
-from alpaca.data.requests import OptionChainRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
-from .clients import option_client, trade_client, trading_stream
+from .clients import trade_client, trading_stream
 from .config import (
     ALPACA_DATA_FEED,
     AWS_PROFILE,
@@ -19,6 +18,7 @@ from .config import (
     FLOW_SCORE_PARTITION,
     LOGGER,
     MIN_FLOW_SCORE,
+    OPTION_PREVIEW_REFRESH_SECONDS,
     PAPER,
     REGULAR_OPEN,
     SYMBOLS,
@@ -36,6 +36,7 @@ from .market_data import (
     resolve_trading_sessions,
 )
 from .models import KeyLevel, TradeSetup
+from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview
 from .state import (
     CONTEXT_LOCK,
     STATE_LOCK,
@@ -52,13 +53,25 @@ from .state import (
     reserved_exit_qty,
     was_symbol_traded_today,
 )
-from .utils import create_client_order_id, get_value, is_option_asset, key_level_to_dict, normalize_text, to_float, to_int_qty
+from .utils import create_client_order_id, get_value, is_option_asset, key_level_to_dict, normalize_text, to_int_qty
+
+
+CONTRACT_PREVIEW_LOCK = threading.Lock()
+CONTRACT_PREVIEW_STATUSES = {"flow_bias", "flow_preview", "ready"}
 
 
 def log_startup_context():
     account = trade_client.get_account()
+    account_summary = account_balance_summary(account)
     clock = trade_client.get_clock()
-    LOGGER.info("Authenticated with Alpaca. paper=%s account_status=%s buying_power=%s", PAPER, account.status, account.buying_power)
+    LOGGER.info(
+        "Authenticated with Alpaca. paper=%s account_status=%s account_balance=%s balance_field=%s buying_power=%s",
+        PAPER,
+        account.status,
+        account_summary["account_balance"],
+        account_summary["account_balance_field"],
+        account_summary.get("buying_power"),
+    )
     LOGGER.info(
         "Starting flow sweep bot for %d symbols. market_open=%s next_open=%s next_close=%s",
         len(SYMBOLS),
@@ -76,7 +89,7 @@ def log_startup_context():
         CONSENSUS_THRESHOLD * 100,
     )
     LOGGER.info(
-        "Orders: allocation=%.1f%% buying_power target_delta=%.2f premium_cap=none data_feed=%s",
+        "Orders: allocation=%.1f%% account_balance target_delta=%.2f premium_cap=none data_feed=%s",
         TRADE_ALLOCATION_PCT * 100,
         TARGET_DELTA,
         ALPACA_DATA_FEED or "default",
@@ -232,6 +245,69 @@ def setup_plan_summary(setup):
     }
 
 
+def should_preview_contract(decision):
+    return (
+        decision.get("status") in CONTRACT_PREVIEW_STATUSES
+        and decision.get("option_type") in {"CALL", "PUT"}
+        and decision.get("direction") in {"bullish", "bearish"}
+    )
+
+
+def attach_contract_previews(decisions):
+    try:
+        account = account_balance_summary()
+    except Exception as exc:
+        LOGGER.warning("Unable to load Alpaca account balance for contract previews: %s", exc)
+        for symbol, decision in decisions.items():
+            decision["contract_preview"] = empty_contract_preview(
+                symbol,
+                decision.get("option_type"),
+                status="error",
+                reason=f"Account balance read failed: {exc}",
+            )
+        return {}
+
+    for symbol, decision in decisions.items():
+        option_type = decision.get("option_type")
+        if should_preview_contract(decision):
+            decision["contract_preview"] = build_contract_preview(symbol, option_type, account=account)
+        else:
+            decision["contract_preview"] = empty_contract_preview(symbol, option_type, reason="No planned entry for this symbol", account=account)
+    return account
+
+
+def refreshed_preview_context(decisions):
+    account = attach_contract_previews(decisions)
+    return {
+        "account": account,
+        "contract_previews_refreshed_at": datetime.now(UTC).isoformat(),
+        "contract_previews_last_monotonic": time.monotonic(),
+    }
+
+
+def refresh_contract_previews_if_needed(force=False):
+    with CONTRACT_PREVIEW_LOCK:
+        with CONTEXT_LOCK:
+            if not daily_context.get("decisions"):
+                return False
+            last_refresh = daily_context.get("contract_previews_last_monotonic", 0.0) or 0.0
+            if not force and time.monotonic() - last_refresh < OPTION_PREVIEW_REFRESH_SECONDS:
+                return False
+            decisions = {symbol: dict(decision) for symbol, decision in daily_context.get("decisions", {}).items()}
+
+        preview_context = refreshed_preview_context(decisions)
+
+        with CONTEXT_LOCK:
+            current_decisions = daily_context.get("decisions", {})
+            for symbol, decision in decisions.items():
+                if symbol in current_decisions:
+                    current_decisions[symbol]["contract_preview"] = decision.get("contract_preview")
+            daily_context.update(preview_context)
+
+    LOGGER.info("Refreshed contract previews for dashboard validation")
+    return True
+
+
 def flow_error_decision(symbol, exc):
     return {
         "symbol": symbol,
@@ -250,6 +326,7 @@ def flow_error_decision(symbol, exc):
         "target_levels": [],
         "flow_rows": [],
         "key_levels": [],
+        "contract_preview": empty_contract_preview(symbol),
     }
 
 
@@ -304,6 +381,8 @@ def prepare_daily_context(now_et=None, force=False):
                         }
                     )
 
+            preview_context = refreshed_preview_context(decisions)
+
             daily_context.update(
                 {
                     "session": trading_day.isoformat(),
@@ -312,6 +391,7 @@ def prepare_daily_context(now_et=None, force=False):
                     "prepared_at": datetime.now(UTC).isoformat(),
                     "setups": {},
                     "decisions": decisions,
+                    **preview_context,
                 }
             )
             high_score_rows = sum(len(decision.get("flow_rows", [])) for decision in decisions.values())
@@ -334,6 +414,8 @@ def prepare_daily_context(now_et=None, force=False):
             else:
                 decisions[symbol].update({"status": "skipped", "reason": "Missing one or more chart levels"})
 
+        preview_context = refreshed_preview_context(decisions)
+
         daily_context.update(
             {
                 "session": trading_day.isoformat(),
@@ -342,55 +424,10 @@ def prepare_daily_context(now_et=None, force=False):
                 "prepared_at": datetime.now(UTC).isoformat(),
                 "setups": setups,
                 "decisions": decisions,
+                **preview_context,
             }
         )
         LOGGER.info("Prepared %s flow sweep setups for session=%s prior_session=%s", len(setups), trading_day, prior_day)
-
-
-def option_contract_type(data):
-    return normalize_text(get_value(data, "contract_type", "")).lower().replace("contracttype.", "")
-
-
-def get_option_delta(data):
-    greeks = get_value(data, "greeks")
-    if not greeks:
-        return None
-    delta = get_value(greeks, "delta")
-    if delta in (None, ""):
-        return None
-    return float(delta)
-
-
-def get_option_ask(data):
-    quote = get_value(data, "latest_quote")
-    if not quote:
-        return 0.0
-    return to_float(get_value(quote, "ask_price"), 0.0)
-
-
-def get_best_option_contract(symbol, option_type):
-    req = OptionChainRequest(underlying_symbol=symbol)
-    chain = option_client.get_option_chain(req)
-    valid_contracts = []
-    desired = "call" if option_type == "CALL" else "put"
-
-    for contract_symbol, data in chain.items():
-        if option_contract_type(data) != desired:
-            continue
-
-        premium = get_option_ask(data)
-        delta = get_option_delta(data)
-        expiration = get_value(data, "expiration_date")
-        if premium <= 0 or delta is None or not expiration:
-            continue
-
-        valid_contracts.append({"symbol": contract_symbol, "premium": premium, "delta": abs(delta), "expiration": expiration})
-
-    if not valid_contracts:
-        return None
-
-    valid_contracts.sort(key=lambda contract: (contract["expiration"], abs(TARGET_DELTA - contract["delta"])))
-    return valid_contracts[0]
 
 
 def target_level_for_entry(setup, entry_price):
@@ -421,9 +458,9 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         return
 
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
-    contract = get_best_option_contract(symbol, option_type)
-    if not contract:
-        LOGGER.info("Skipping %s: no %s contract with usable quote/greeks", symbol, option_type)
+    contract = build_contract_preview(symbol, option_type)
+    if contract.get("status") != "ready" or contract.get("quantity", 0) < 1:
+        LOGGER.info("Skipping %s: no usable %s contract preview. status=%s reason=%s", symbol, option_type, contract.get("status"), contract.get("reason"))
         return
 
     target_level = target_level_for_entry(setup, signal_bar["close"])
@@ -431,17 +468,11 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         LOGGER.info("Skipping %s: no target level beyond entry %.2f", symbol, signal_bar["close"])
         return
 
-    account = trade_client.get_account()
-    trade_allocation = float(account.buying_power) * TRADE_ALLOCATION_PCT
-    contract_cost = contract["premium"] * 100
-    qty = math.floor(trade_allocation / contract_cost)
-    if qty < 1:
-        LOGGER.info("Skipping %s: allocation %.2f cannot buy 1x %s at %.2f", symbol, trade_allocation, contract["symbol"], contract["premium"])
-        return
+    qty = to_int_qty(contract.get("quantity", 0))
 
     stop_underlying = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
     LOGGER.info(
-        "ENTER %s %s after %s sweep %.2f close %.2f stop %.2f target %s %.2f: %sx %s ask=%.2f delta=%.2f exp=%s",
+        "ENTER %s %s after %s sweep %.2f close %.2f stop %.2f target %s %.2f: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
         symbol,
         option_type,
         swept_level.name,
@@ -452,9 +483,13 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         target_level.price,
         qty,
         contract["symbol"],
-        contract["premium"],
+        contract["ask"],
         contract["delta"],
+        contract.get("gamma"),
+        contract.get("theta"),
         contract["expiration"],
+        contract.get("account_balance", 0.0),
+        contract.get("allocation_amount", 0.0),
     )
 
     req = MarketOrderRequest(
@@ -486,6 +521,13 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             "swept_level_price": swept_level.price,
             "entry_order_id": order_id,
             "entry_status": "submitted",
+            "entry_option_delta": contract.get("delta"),
+            "entry_option_gamma": contract.get("gamma"),
+            "entry_option_theta": contract.get("theta"),
+            "entry_option_ask": contract.get("ask"),
+            "entry_contract_cost": contract.get("contract_cost"),
+            "entry_account_balance": contract.get("account_balance"),
+            "entry_allocation_amount": contract.get("allocation_amount"),
             "total_qty": 0,
             "requested_qty": qty,
             "entry_submitted_at": datetime.now(UTC).isoformat(),
@@ -766,6 +808,8 @@ def in_entry_window(close_time_et):
 
 
 def process_completed_five_minute_bar(symbol, bar):
+    refresh_contract_previews_if_needed()
+
     if not in_entry_window(bar["close_time"]):
         return
 

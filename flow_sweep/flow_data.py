@@ -114,6 +114,7 @@ def summarize_flow_rows(symbol, rows):
         "trigger_levels": [],
         "target_levels": [],
         "flow_rows": flow_rows,
+        "key_levels": [],
     }
 
     if total_premium <= 0:

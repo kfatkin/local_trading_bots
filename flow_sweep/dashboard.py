@@ -15,6 +15,7 @@ from .config import (
     ET,
     LOGGER,
     MIN_FLOW_SCORE,
+    OPTION_PREVIEW_REFRESH_SECONDS,
     PAPER,
     SYMBOLS,
     TARGET_DELTA,
@@ -50,6 +51,8 @@ def default_decision(symbol):
         "trigger_levels": [],
         "target_levels": [],
         "flow_rows": [],
+        "key_levels": [],
+        "contract_preview": {"status": "not_planned", "reason": "Waiting for daily preparation"},
     }
 
 
@@ -68,6 +71,11 @@ def position_payload(symbol, position):
         "target_name": position.get("target_name"),
         "swept_level": position.get("swept_level"),
         "swept_level_price": round_or_none(position.get("swept_level_price")),
+        "entry_option_delta": round_or_none(position.get("entry_option_delta"), 4),
+        "entry_option_gamma": round_or_none(position.get("entry_option_gamma"), 4),
+        "entry_option_theta": round_or_none(position.get("entry_option_theta"), 4),
+        "entry_option_ask": round_or_none(position.get("entry_option_ask"), 4),
+        "entry_contract_cost": round_or_none(position.get("entry_contract_cost"), 2),
     }
 
 
@@ -95,6 +103,13 @@ def completed_bar_payload(symbol, bar):
 
 
 def dashboard_status_payload():
+    try:
+        from .strategy import refresh_contract_previews_if_needed
+
+        refresh_contract_previews_if_needed()
+    except Exception as exc:
+        LOGGER.warning("Unable to refresh contract previews for dashboard: %s", exc)
+
     now_et = datetime.now(ET)
     display_host = "127.0.0.1" if DASHBOARD_HOST in {"0.0.0.0", "::"} else DASHBOARD_HOST
 
@@ -116,6 +131,8 @@ def dashboard_status_payload():
             "ready_count": sum(1 for decision in decisions if decision.get("status") == "ready"),
             "high_score_flow_count": sum(len(decision.get("flow_rows", [])) for decision in decisions),
             "last_attempt_seconds_ago": round(time.monotonic() - daily_context.get("last_attempt_monotonic", 0.0), 1),
+            "account": daily_context.get("account") or {},
+            "contract_previews_refreshed_at": daily_context.get("contract_previews_refreshed_at"),
         }
 
     return {
@@ -127,6 +144,7 @@ def dashboard_status_payload():
             "consensus_threshold": CONSENSUS_THRESHOLD,
             "trade_allocation_pct": TRADE_ALLOCATION_PCT,
             "target_delta": TARGET_DELTA,
+            "option_preview_refresh_seconds": OPTION_PREVIEW_REFRESH_SECONDS,
             "entry_window": f"{ENTRY_WINDOW_START.strftime('%H:%M')}-{ENTRY_WINDOW_END.strftime('%H:%M')} ET",
             "dashboard_url": f"http://{display_host}:{DASHBOARD_PORT}",
         },
@@ -216,10 +234,29 @@ DASHBOARD_HTML = """<!doctype html>
         .status-ready { color: var(--ready); font-weight: 700; }
         .status-flow_preview { color: var(--warn); font-weight: 700; }
         .status-skipped, .status-pending { color: var(--skip); font-weight: 700; }
-        .status-error { color: var(--warn); font-weight: 700; }
+        .status-error, .status-unavailable, .status-too_expensive { color: var(--warn); font-weight: 700; }
         .levels { display: flex; flex-wrap: wrap; gap: 6px; }
         .level { border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; white-space: nowrap; }
         .muted { color: var(--muted); }
+        .key-level-grid { display: grid; grid-template-columns: repeat(2, minmax(145px, 1fr)); gap: 6px; min-width: 310px; }
+        .key-level-card { border: 1px solid var(--border); border-radius: 6px; padding: 6px; background: color-mix(in srgb, var(--panel) 90%, var(--bg)); }
+        .key-level-card.observed { border-color: var(--ready); background: color-mix(in srgb, var(--ready) 11%, var(--panel)); }
+        .key-level-card.skipped { opacity: 0.72; }
+        .key-level-card.pending { border-style: dashed; }
+        .key-level-label { display: flex; justify-content: space-between; gap: 8px; font-weight: 700; }
+        .key-level-price { font-variant-numeric: tabular-nums; }
+        .key-level-action { margin-top: 3px; font-size: 12px; color: var(--muted); }
+        .key-level-card.observed .key-level-action { color: var(--text); font-weight: 700; }
+        .contract-preview { min-width: 260px; border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: color-mix(in srgb, var(--panel) 91%, var(--bg)); }
+        .contract-preview.ready { border-color: var(--ready); background: color-mix(in srgb, var(--ready) 9%, var(--panel)); }
+        .contract-preview.error, .contract-preview.unavailable, .contract-preview.too_expensive { border-color: var(--warn); }
+        .contract-title { font-weight: 800; font-variant-numeric: tabular-nums; }
+        .contract-subtitle { margin-top: 2px; color: var(--muted); }
+        .contract-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 10px; margin-top: 8px; }
+        .contract-label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+        .contract-value { font-weight: 700; font-variant-numeric: tabular-nums; }
+        .contract-note { margin-top: 7px; color: var(--muted); font-size: 12px; }
+        .contract-warning { margin-top: 6px; color: var(--warn); font-size: 12px; font-weight: 700; }
         .flow-detail-row td { background: color-mix(in srgb, var(--panel) 92%, var(--bg)); padding-top: 0; }
         .flow-details summary { cursor: pointer; color: var(--muted); font-weight: 700; padding: 8px 0; }
         .flow-details[open] summary { color: var(--text); }
@@ -264,6 +301,15 @@ DASHBOARD_HTML = """<!doctype html>
         function pct(value) { return value == null ? '-' : `${(Number(value) * 100).toFixed(1)}%`; }
         function usd(value) { return value == null ? '-' : money.format(Number(value)); }
         function px(value) { return value == null ? '-' : price.format(Number(value)); }
+        function premium(value) { return value == null ? '-' : `$${Number(value).toFixed(2)}`; }
+        function fixed(value, digits = 4) { return value == null ? '-' : Number(value).toFixed(digits); }
+        function whole(value) { return value == null ? '-' : Number(value).toLocaleString(); }
+        function expiry(value) {
+            if (!value) return '-';
+            const parts = String(value).split('-').map(Number);
+            if (parts.length !== 3 || parts.some(Number.isNaN)) return esc(value);
+            return esc(new Date(parts[0], parts[1] - 1, parts[2]).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+        }
         function shortDateTime(value) {
             if (!value) return '-';
             const parsed = new Date(value);
@@ -273,6 +319,53 @@ DASHBOARD_HTML = """<!doctype html>
         function levels(items) {
             if (!items || !items.length) return '<span class="muted">none</span>';
             return `<div class="levels">${items.map(item => `<span class="level">${esc(item.name)} ${px(item.price)}</span>`).join('')}</div>`;
+        }
+        function keyLevelAction(level) {
+            if (level.status === 'pending') return 'Pending premarket';
+            if (level.status === 'missing') return 'Missing';
+            if (level.role === 'observed' && level.side === 'support') return 'Observed: calls on close back above';
+            if (level.role === 'observed' && level.side === 'resistance') return 'Observed: puts on close back below';
+            return 'Skipped for this setup';
+        }
+        function keyLevels(decision) {
+            const rows = decision.key_levels || [];
+            if (!rows.length) return '<span class="muted">levels pending</span>';
+            return `<div class="key-level-grid">${rows.map(level => {
+                const priceText = level.price == null ? esc(level.status || '-') : px(level.price);
+                const classes = ['key-level-card', level.role || 'skipped', level.status || 'ready', level.side || ''].join(' ');
+                return `<div class="${classes}" title="${esc(level.note || '')}">
+                    <div class="key-level-label"><span>${esc(level.label || level.name)}</span><span class="key-level-price">${priceText}</span></div>
+                    <div class="key-level-action">${keyLevelAction(level)}</div>
+                </div>`;
+            }).join('')}</div>`;
+        }
+        function contractPreview(decision) {
+            const preview = decision.contract_preview || {};
+            if (!preview.symbol) {
+                return `<span class="muted">${esc(preview.reason || 'none')}</span>`;
+            }
+            const status = preview.status || 'unknown';
+            const title = `${decision.symbol} $${px(preview.strike)} ${preview.option_type || ''}`;
+            const warnings = preview.warnings && preview.warnings.length ? `<div class="contract-warning">${preview.warnings.map(esc).join(' / ')}</div>` : '';
+            const oneContract = preview.minimum_one_contract ? '<div class="contract-warning">Minimum 1 contract sizing override</div>' : '';
+            return `<div class="contract-preview ${esc(status)}">
+                <div class="contract-title">${esc(preview.symbol)}</div>
+                <div class="contract-subtitle">${esc(title)} exp ${expiry(preview.expiration)}</div>
+                <div class="contract-grid">
+                    <div><div class="contract-label">Delta</div><div class="contract-value">${fixed(preview.delta, 4)}</div></div>
+                    <div><div class="contract-label">Gamma</div><div class="contract-value">${fixed(preview.gamma, 4)}</div></div>
+                    <div><div class="contract-label">Theta</div><div class="contract-value">${fixed(preview.theta, 4)}</div></div>
+                    <div><div class="contract-label">Ask</div><div class="contract-value">${premium(preview.ask)}</div></div>
+                    <div><div class="contract-label">Cost</div><div class="contract-value">${usd(preview.contract_cost)}</div></div>
+                    <div><div class="contract-label">Qty</div><div class="contract-value">${esc(preview.quantity || 0)}</div></div>
+                    <div><div class="contract-label">Spread</div><div class="contract-value">${pct(preview.spread_pct)}</div></div>
+                    <div><div class="contract-label">Volume</div><div class="contract-value">${whole(preview.volume)}</div></div>
+                    <div><div class="contract-label">OI</div><div class="contract-value">${whole(preview.open_interest)}</div></div>
+                </div>
+                <div class="contract-note">${esc(status)} / ${usd(preview.allocation_amount)} allocation / ${usd(preview.account_balance)} balance</div>
+                <div class="contract-note">${esc(preview.reason || '')} / candidates ${esc(preview.candidate_count || 0)}</div>
+                ${oneContract}${warnings}
+            </div>`;
         }
         function contractText(row) {
             const parts = [row.option_type, row.strike, row.expiry].filter(Boolean).map(esc);
@@ -300,7 +393,7 @@ DASHBOARD_HTML = """<!doctype html>
         function flowDetails(decision) {
             const rows = decision.flow_rows || [];
             if (!rows.length) {
-                return `<tr class="flow-detail-row"><td></td><td colspan="5"><span class="muted">No >70 flow rows from the prior session.</span></td></tr>`;
+                return `<tr class="flow-detail-row"><td></td><td colspan="6"><span class="muted">No >70 flow rows from the prior session.</span></td></tr>`;
             }
             const openAttr = expandedFlowSymbols.has(decision.symbol) ? ' open' : '';
             const body = rows.map(row => {
@@ -317,7 +410,7 @@ DASHBOARD_HTML = """<!doctype html>
                     <td class="reasons">${esc(reasons)}</td>
                 </tr>`;
             }).join('');
-            return `<tr class="flow-detail-row"><td></td><td colspan="5">
+            return `<tr class="flow-detail-row"><td></td><td colspan="6">
                 <details class="flow-details" data-symbol="${esc(decision.symbol)}" ontoggle="toggleFlowDetail(this)"${openAttr}>
                     <summary>${esc(decision.symbol)} high-score flow from prior session (${rows.length})</summary>
                     <table class="flow-table">
@@ -348,22 +441,25 @@ DASHBOARD_HTML = """<!doctype html>
                 `Prior ${esc(data.daily_context.prior_session || '-')}`,
                 `Mode ${data.bot.paper ? 'paper' : 'live'}`,
                 `Entry ${esc(data.bot.entry_window)}`,
-                `Refresh 5s`
+                `Refresh 5s`,
+                `Contracts ${shortDateTime(data.daily_context.contract_previews_refreshed_at)}`
             ].map(item => `<span class="pill">${item}</span>`).join('');
             document.getElementById('metrics').innerHTML = [
                 metric('Ready Setups', ready),
                 metric('High-Score Flow Rows', data.daily_context.high_score_flow_count || 0),
                 metric('Active Positions', data.active_positions.length),
                 metric('Pending Orders', data.pending_entry_orders.length + data.pending_exit_orders.length),
-                metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% BP`)
+                metric('Account Balance', usd(data.daily_context.account && data.daily_context.account.account_balance)),
+                metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% balance`)
             ].join('');
-            table('decisions', ['Symbol', 'Decision', 'Consensus', 'Calls/Puts From', 'Targets', 'Reason'], data.decisions.flatMap(d => {
+            table('decisions', ['Symbol', 'Decision', 'Consensus', 'Key Levels', 'Planned Contract', 'Targets', 'Reason'], data.decisions.flatMap(d => {
                 const directionClass = d.direction === 'bullish' ? 'bullish' : d.direction === 'bearish' ? 'bearish' : 'neutral';
                 const mainRow = `<tr>
                     <td class="symbol">${esc(d.symbol)}</td>
                     <td><span class="${directionClass}">${esc(d.direction)}</span><br><span class="status-${esc(d.status)}">${esc(d.status)}</span><br><span class="muted">${esc(d.option_type || '-')} score ${esc(d.top_score || 0)}</span></td>
                     <td>${pct(d.consensus)}<br><span class="muted">Bull ${usd(d.bullish_premium)} / Bear ${usd(d.bearish_premium)}</span></td>
-                    <td>${levels(d.trigger_levels)}</td>
+                    <td>${keyLevels(d)}</td>
+                    <td>${contractPreview(d)}</td>
                     <td>${levels(d.target_levels)}</td>
                     <td>${esc(d.reason || '')}<br><span class="muted">Rows ${esc(d.directional_row_count || 0)} of ${esc(d.raw_row_count || 0)}</span></td>
                 </tr>`;

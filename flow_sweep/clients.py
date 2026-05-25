@@ -14,6 +14,7 @@ from .config import API_KEY, AWS_PROFILE, AWS_REGION, PAPER, SECRET_KEY, UW_TABL
 trade_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
 stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 option_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
+raw_option_client = OptionHistoricalDataClient(API_KEY, SECRET_KEY, raw_data=True)
 stock_stream = StockDataStream(API_KEY, SECRET_KEY)
 trading_stream = TradingStream(API_KEY, SECRET_KEY, paper=PAPER)
 nyse_calendar = mcal.get_calendar("NYSE")
