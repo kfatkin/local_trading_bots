@@ -64,7 +64,7 @@ SYMBOLS = [
     "TSLA",
     "STX",
     "SNDK",
-    "MSFT",
+  #  "MSFT",
     "TSM",
     "WDC",
     "LITE",
