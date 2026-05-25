@@ -22,9 +22,9 @@ Before the trading session, it queries the `uw-data` DynamoDB table with AWS pro
 
 For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 60% of the total directional premium.
 
-For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. After 10:00 ET, a 5-minute candle must sweep a relevant low, close meaningfully back above it, and then the next 5-minute candle must confirm by holding above that level before the bot buys calls.
+For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. Between 10:00 and 15:00 ET, a 5-minute candle must sweep a relevant low, close meaningfully back above it, and then the next 5-minute candle must confirm by holding above that level before the bot buys calls.
 
-For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. After 10:00 ET, a 5-minute candle must sweep a relevant high, close meaningfully back below it, and then the next 5-minute candle must confirm by holding below that level before the bot buys puts.
+For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. Between 10:00 and 15:00 ET, a 5-minute candle must sweep a relevant high, close meaningfully back below it, and then the next 5-minute candle must confirm by holding below that level before the bot buys puts.
 
 Contracts are selected from the nearest active expiration, including 0DTE when available. The selector first scopes candidates to contracts within `0.15` absolute delta of the configured `0.30` target when available, builds a candidate band from the three contracts just below target delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 

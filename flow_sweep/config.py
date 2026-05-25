@@ -78,7 +78,7 @@ TRADE_EVENT_LOG_LIMIT = env_int("FLOW_SWEEP_TRADE_EVENT_LOG_LIMIT", 300)
 PREMARKET_START = dt_time(4, 0)
 REGULAR_OPEN = dt_time(9, 30)
 ENTRY_WINDOW_START = dt_time(10, 0)
-ENTRY_WINDOW_END = dt_time(10, 30)
+ENTRY_WINDOW_END = dt_time(15, 0)
 EOD_EXIT_TIME = dt_time(15, 55)
 
 LOGGER = logging.getLogger("flow_sweep_bot")
