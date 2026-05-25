@@ -14,6 +14,7 @@ from .config import (
     OPTION_CANDIDATES_BELOW_TARGET,
     OPTION_EXPIRATION_LOOKAHEAD_DAYS,
     OPTION_MAX_ACCOUNT_BALANCE_PCT,
+    OPTION_MAX_DELTA_DISTANCE,
     OPTION_MAX_QUOTE_AGE_SECONDS,
     OPTION_MAX_SPREAD_PCT,
     OPTION_MIN_OPEN_INTEREST,
@@ -266,18 +267,20 @@ def candidate_from_snapshot(contract, snapshot, option_type):
 
 
 def candidate_delta_band(candidates):
+    near_target = [candidate for candidate in candidates if candidate["delta_distance"] <= OPTION_MAX_DELTA_DISTANCE]
+    scoped_candidates = near_target or candidates
     below = sorted(
-        [candidate for candidate in candidates if candidate["delta_abs"] <= TARGET_DELTA],
+        [candidate for candidate in scoped_candidates if candidate["delta_abs"] <= TARGET_DELTA],
         key=lambda candidate: TARGET_DELTA - candidate["delta_abs"],
     )[:OPTION_CANDIDATES_BELOW_TARGET]
     above = sorted(
-        [candidate for candidate in candidates if candidate["delta_abs"] > TARGET_DELTA],
+        [candidate for candidate in scoped_candidates if candidate["delta_abs"] > TARGET_DELTA],
         key=lambda candidate: candidate["delta_abs"] - TARGET_DELTA,
     )[:OPTION_CANDIDATES_ABOVE_TARGET]
     band = below + above
     if band:
         return band
-    return sorted(candidates, key=lambda candidate: candidate["delta_distance"])[: OPTION_CANDIDATES_BELOW_TARGET + OPTION_CANDIDATES_ABOVE_TARGET]
+    return sorted(scoped_candidates, key=lambda candidate: candidate["delta_distance"])[: OPTION_CANDIDATES_BELOW_TARGET + OPTION_CANDIDATES_ABOVE_TARGET]
 
 
 def fetch_recent_option_volumes(option_symbols):

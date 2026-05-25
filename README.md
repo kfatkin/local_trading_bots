@@ -26,7 +26,7 @@ For bullish flow, the bot watches premarket low, prior-day low, and prior-week l
 
 For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant high and closes back below it, the bot buys puts.
 
-Contracts are selected from the nearest active expiration, including 0DTE when available. The selector builds a candidate band from the three contracts just below absolute `0.30` delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
+Contracts are selected from the nearest active expiration, including 0DTE when available. The selector first scopes candidates to contracts within `0.15` absolute delta of the configured `0.30` target when available, builds a candidate band from the three contracts just below target delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 
 ## Risk And Exits
 
@@ -67,6 +67,7 @@ FLOW_SWEEP_OPTION_EXPIRATION_LOOKAHEAD_DAYS=21
 FLOW_SWEEP_OPTION_MAX_SPREAD_PCT=0.30
 FLOW_SWEEP_OPTION_MIN_VOLUME=1
 FLOW_SWEEP_OPTION_MIN_OPEN_INTEREST=0
+FLOW_SWEEP_OPTION_MAX_DELTA_DISTANCE=0.15
 FLOW_SWEEP_OPTION_CANDIDATES_BELOW_TARGET=3
 FLOW_SWEEP_OPTION_CANDIDATES_ABOVE_TARGET=2
 FLOW_SWEEP_OPTION_MAX_ACCOUNT_BALANCE_PCT=0.20
