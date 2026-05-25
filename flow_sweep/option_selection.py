@@ -14,11 +14,13 @@ from .config import (
     OPTION_CANDIDATES_BELOW_TARGET,
     OPTION_EXPIRATION_LOOKAHEAD_DAYS,
     OPTION_MAX_ACCOUNT_BALANCE_PCT,
+    OPTION_MAX_QUOTE_AGE_SECONDS,
     OPTION_MAX_SPREAD_PCT,
     OPTION_MIN_OPEN_INTEREST,
     OPTION_MIN_VOLUME,
     TARGET_DELTA,
     TRADE_ALLOCATION_PCT,
+    UTC,
 )
 from .utils import get_value, normalize_text, round_or_none
 
@@ -37,6 +39,12 @@ def optional_int(value):
     if number is None:
         return None
     return int(number)
+
+
+def truthy(value):
+    if isinstance(value, bool):
+        return value
+    return normalize_text(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def option_type_enum(option_type):
@@ -188,6 +196,27 @@ def timestamp_text(value):
     return normalize_text(value) or None
 
 
+def parse_timestamp(value):
+    text = timestamp_text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def quote_age_seconds(quote_time, now=None):
+    parsed = parse_timestamp(quote_time)
+    if not parsed:
+        return None
+    now = now or datetime.now(UTC)
+    return max((now - parsed.astimezone(UTC)).total_seconds(), 0.0)
+
+
 def daily_bar_payload(snapshot):
     bar = get_value(snapshot, "daily_bar") or get_value(snapshot, "dailyBar")
     if not bar:
@@ -217,6 +246,8 @@ def candidate_from_snapshot(contract, snapshot, option_type):
         "symbol": get_value(contract, "symbol"),
         "underlying_symbol": get_value(contract, "underlying_symbol"),
         "option_type": option_type,
+        "asset_status": normalize_text(get_value(contract, "status")),
+        "tradable": bool(get_value(contract, "tradable", True)),
         "strike": strike,
         "expiration": iso_date(expiration),
         "contract_size": int(size),
@@ -325,10 +356,10 @@ def liquidity_rank(candidate):
     open_interest = candidate.get("open_interest") or 0
     return (
         0 if candidate.get("liquidity_pass") else 1,
-        candidate.get("delta_distance", math.inf),
         spread_pct,
         -volume,
         -open_interest,
+        candidate.get("delta_distance", math.inf),
         candidate.get("contract_cost", math.inf),
     )
 
@@ -422,6 +453,78 @@ def apply_position_size(candidate, account):
         "max_single_contract_amount": max_single_contract_amount,
         "minimum_one_contract": minimum_one_contract,
         "sizing_warnings": sizing_warnings,
+    }
+
+
+def validate_entry_contract(contract_preview, require_market_open=True):
+    now = datetime.now(UTC)
+    blocking = []
+    warnings = []
+    symbol = contract_preview.get("symbol")
+    qty = optional_int(contract_preview.get("quantity")) or 0
+    contract_cost = optional_float(contract_preview.get("contract_cost")) or 0.0
+    estimated_notional = round(qty * contract_cost, 2)
+
+    if contract_preview.get("status") != "ready":
+        blocking.append(f"contract status is {contract_preview.get('status') or 'unknown'}")
+    if not symbol:
+        blocking.append("missing option symbol")
+    if qty < 1:
+        blocking.append("quantity is less than 1")
+    if optional_float(contract_preview.get("bid")) is None or optional_float(contract_preview.get("bid")) <= 0:
+        blocking.append("missing positive bid")
+    if optional_float(contract_preview.get("ask")) is None or optional_float(contract_preview.get("ask")) <= 0:
+        blocking.append("missing positive ask")
+    if optional_float(contract_preview.get("delta_abs")) is None:
+        blocking.append("missing delta")
+    if contract_preview.get("liquidity_pass") is False:
+        blocking.append("liquidity filters did not pass")
+    if contract_preview.get("tradable") is False:
+        blocking.append("contract is not tradable")
+
+    quote_age = quote_age_seconds(contract_preview.get("quote_time"), now=now)
+    if quote_age is None:
+        warnings.append("quote timestamp unavailable")
+    elif quote_age > OPTION_MAX_QUOTE_AGE_SECONDS:
+        message = f"quote age {quote_age:.0f}s > {OPTION_MAX_QUOTE_AGE_SECONDS}s"
+        if require_market_open:
+            blocking.append(message)
+        else:
+            warnings.append(message)
+
+    account_summary = {}
+    market_open = None
+    try:
+        account = trade_client.get_account()
+        account_summary = account_balance_summary(account)
+        if truthy(get_value(account, "trading_blocked", False)):
+            blocking.append("account trading is blocked")
+        if truthy(get_value(account, "account_blocked", False)):
+            blocking.append("account is blocked")
+        buying_power = optional_float(get_value(account, "buying_power"))
+        if buying_power is not None and estimated_notional > buying_power:
+            blocking.append(f"estimated notional ${estimated_notional:.2f} exceeds buying power ${buying_power:.2f}")
+    except Exception as exc:
+        blocking.append(f"account preflight failed: {exc}")
+
+    try:
+        clock = trade_client.get_clock()
+        market_open = bool(get_value(clock, "is_open", False))
+        if require_market_open and not market_open:
+            blocking.append("Alpaca market clock is closed")
+    except Exception as exc:
+        blocking.append(f"market clock preflight failed: {exc}")
+
+    return {
+        "ok": not blocking,
+        "blocking": blocking,
+        "warnings": warnings,
+        "checked_at": now.isoformat(),
+        "require_market_open": require_market_open,
+        "market_open": market_open,
+        "estimated_notional": estimated_notional,
+        "quote_age_seconds": round(quote_age, 1) if quote_age is not None else None,
+        **account_summary,
     }
 
 

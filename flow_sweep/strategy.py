@@ -38,7 +38,7 @@ from .market_data import (
     resolve_trading_sessions,
 )
 from .models import KeyLevel, TradeSetup
-from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview, option_market_snapshot
+from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview, option_market_snapshot, validate_entry_contract
 from .state import (
     CONTEXT_LOCK,
     STATE_LOCK,
@@ -278,16 +278,45 @@ def attach_contract_previews(decisions):
     return account
 
 
-def refreshed_preview_context(decisions):
+def refreshed_preview_context(decisions, reason="scheduled"):
     account = attach_contract_previews(decisions)
     return {
         "account": account,
         "contract_previews_refreshed_at": datetime.now(UTC).isoformat(),
         "contract_previews_last_monotonic": time.monotonic(),
+        "contract_previews_refresh_reason": reason,
     }
 
 
-def refresh_contract_previews_if_needed(force=False):
+def publish_contract_preview(symbol, contract, reason):
+    with CONTEXT_LOCK:
+        decisions = daily_context.get("decisions", {})
+        if symbol in decisions:
+            decisions[symbol]["contract_preview"] = contract
+        daily_context["contract_previews_refreshed_at"] = datetime.now(UTC).isoformat()
+        daily_context["contract_previews_last_monotonic"] = time.monotonic()
+        daily_context["contract_previews_refresh_reason"] = reason
+
+
+def build_fresh_entry_contract(symbol, option_type):
+    contract = build_contract_preview(symbol, option_type)
+    publish_contract_preview(symbol, contract, "entry_recheck")
+    LOGGER.info(
+        "Entry contract recheck %s %s selected=%s status=%s delta=%s bid=%s ask=%s qty=%s reason=%s",
+        symbol,
+        option_type,
+        contract.get("symbol"),
+        contract.get("status"),
+        contract.get("delta"),
+        contract.get("bid"),
+        contract.get("ask"),
+        contract.get("quantity"),
+        contract.get("reason"),
+    )
+    return contract
+
+
+def refresh_contract_previews_if_needed(force=False, reason="scheduled"):
     with CONTRACT_PREVIEW_LOCK:
         with CONTEXT_LOCK:
             if not daily_context.get("decisions"):
@@ -297,7 +326,7 @@ def refresh_contract_previews_if_needed(force=False):
                 return False
             decisions = {symbol: dict(decision) for symbol, decision in daily_context.get("decisions", {}).items()}
 
-        preview_context = refreshed_preview_context(decisions)
+        preview_context = refreshed_preview_context(decisions, reason=reason)
 
         with CONTEXT_LOCK:
             current_decisions = daily_context.get("decisions", {})
@@ -306,7 +335,7 @@ def refresh_contract_previews_if_needed(force=False):
                     current_decisions[symbol]["contract_preview"] = decision.get("contract_preview")
             daily_context.update(preview_context)
 
-    LOGGER.info("Refreshed contract previews for dashboard validation")
+    LOGGER.info("Refreshed contract previews reason=%s", reason)
     return True
 
 
@@ -383,7 +412,7 @@ def prepare_daily_context(now_et=None, force=False):
                         }
                     )
 
-            preview_context = refreshed_preview_context(decisions)
+            preview_context = refreshed_preview_context(decisions, reason="preopen_preview")
 
             daily_context.update(
                 {
@@ -416,7 +445,7 @@ def prepare_daily_context(now_et=None, force=False):
             else:
                 decisions[symbol].update({"status": "skipped", "reason": "Missing one or more chart levels"})
 
-        preview_context = refreshed_preview_context(decisions)
+        preview_context = refreshed_preview_context(decisions, reason="market_open_setup")
 
         daily_context.update(
             {
@@ -489,7 +518,13 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         return
 
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
-    contract = build_contract_preview(symbol, option_type)
+    contract = build_fresh_entry_contract(symbol, option_type)
+    preflight = validate_entry_contract(contract, require_market_open=True)
+    contract["entry_preflight"] = preflight
+    publish_contract_preview(symbol, contract, "entry_preflight")
+    if not preflight.get("ok"):
+        LOGGER.warning("Skipping %s: Alpaca entry preflight failed: %s", symbol, "; ".join(preflight.get("blocking") or []))
+        return
     if contract.get("status") != "ready" or contract.get("quantity", 0) < 1:
         LOGGER.info("Skipping %s: no usable %s contract preview. status=%s reason=%s", symbol, option_type, contract.get("status"), contract.get("reason"))
         return
@@ -572,6 +607,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             "entry_contract_cost": contract.get("contract_cost"),
             "entry_account_balance": contract.get("account_balance"),
             "entry_allocation_amount": contract.get("allocation_amount"),
+            "entry_preflight": preflight,
             "total_qty": 0,
             "requested_qty": qty,
             "entry_submitted_at": datetime.now(UTC).isoformat(),
@@ -857,7 +893,7 @@ def in_entry_window(close_time_et):
 
 
 def process_completed_five_minute_bar(symbol, bar):
-    refresh_contract_previews_if_needed()
+    refresh_contract_previews_if_needed(reason="five_minute_bar")
 
     if not in_entry_window(bar["close_time"]):
         return

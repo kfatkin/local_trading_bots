@@ -26,7 +26,7 @@ For bullish flow, the bot watches premarket low, prior-day low, and prior-week l
 
 For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant high and closes back below it, the bot buys puts.
 
-Contracts are selected from the nearest active expiration, including 0DTE when available. The selector builds a candidate band from the three contracts just below absolute `0.30` delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest.
+Contracts are selected from the nearest active expiration, including 0DTE when available. The selector builds a candidate band from the three contracts just below absolute `0.30` delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 
 ## Risk And Exits
 
@@ -70,6 +70,7 @@ FLOW_SWEEP_OPTION_MIN_OPEN_INTEREST=0
 FLOW_SWEEP_OPTION_CANDIDATES_BELOW_TARGET=3
 FLOW_SWEEP_OPTION_CANDIDATES_ABOVE_TARGET=2
 FLOW_SWEEP_OPTION_MAX_ACCOUNT_BALANCE_PCT=0.20
+FLOW_SWEEP_OPTION_MAX_QUOTE_AGE_SECONDS=300
 ALPACA_DATA_FEED=iex
 BOT_DASHBOARD_ENABLED=true
 BOT_DASHBOARD_HOST=127.0.0.1
@@ -110,7 +111,7 @@ The decision table makes the planned entries explicit:
 - Bullish symbols show the lows where the bot will look for call entries.
 - Bearish symbols show the highs where the bot will look for put entries.
 
-The planned contract column refreshes from Alpaca on the 5-minute strategy cadence and is also refreshed opportunistically by the dashboard with a 5-minute cache. It shows the selected contract symbol, strike, expiration, delta, gamma, theta, ask price, estimated cost per contract, planned quantity, spread, recent option volume, open interest, account balance, allocation amount, and any sizing/liquidity warnings. Live entries use the same selector and account-balance sizing shown in this preview.
+The planned contract column refreshes from Alpaca on the 5-minute strategy cadence and is also refreshed opportunistically by the dashboard with a 5-minute cache. It shows the selected contract symbol, strike, expiration, delta, gamma, theta, ask price, estimated cost per contract, planned quantity, spread, recent option volume, open interest, account balance, allocation amount, and any sizing/liquidity warnings. Live entries force one more Alpaca contract recheck right before order submission, then run an entry preflight against the selected contract, account, buying power, market clock, liquidity checks, and quote freshness before submitting the market buy.
 
 When a trade is active, the dashboard combines Alpaca broker truth with the bot plan. The active-position row shows Alpaca quantity, average entry, current mark, market value, cost basis, unrealized PnL, the bot-managed stop mode, the 1.5R breakeven trigger, the breakeven option stop price, and the selected take-profit target. Broker open option orders are listed separately from bot-local pending orders.
 
@@ -148,6 +149,14 @@ Safe startup smoke test without opening Alpaca streams or submitting orders:
 ```bash
 python3 main.py --smoke-test
 ```
+
+No-trade Alpaca entry preflight for the currently selected contracts:
+
+```bash
+python3 main.py --entry-preflight
+```
+
+This checks the live Alpaca account, clock, contract chain, snapshots, liquidity filters, buying power, and quote freshness without submitting orders. When run outside market hours, quote-age issues are reported as warnings rather than blocking failures.
 
 Docker smoke test after building the image:
 

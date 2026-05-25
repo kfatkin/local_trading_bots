@@ -146,6 +146,7 @@ def position_payload(symbol, position, broker_position=None):
         "entry_option_ask": round_or_none(position.get("entry_option_ask"), 4),
         "entry_option_fill_price": round_or_none(position.get("entry_option_fill_price"), 4),
         "entry_contract_cost": round_or_none(position.get("entry_contract_cost"), 2),
+        "entry_preflight": position.get("entry_preflight"),
         "latest_option_market_price": round_or_none(position.get("latest_option_market_price"), 4),
         "latest_option_bid": round_or_none(position.get("latest_option_bid"), 4),
         "latest_option_ask": round_or_none(position.get("latest_option_ask"), 4),
@@ -181,7 +182,7 @@ def dashboard_status_payload():
     try:
         from .strategy import refresh_contract_previews_if_needed
 
-        refresh_contract_previews_if_needed()
+        refresh_contract_previews_if_needed(reason="dashboard")
     except Exception as exc:
         LOGGER.warning("Unable to refresh contract previews for dashboard: %s", exc)
 
@@ -234,6 +235,7 @@ def dashboard_status_payload():
             "last_attempt_seconds_ago": round(time.monotonic() - daily_context.get("last_attempt_monotonic", 0.0), 1),
             "account": daily_context.get("account") or {},
             "contract_previews_refreshed_at": daily_context.get("contract_previews_refreshed_at"),
+            "contract_previews_refresh_reason": daily_context.get("contract_previews_refresh_reason"),
         }
 
     return {
@@ -490,6 +492,9 @@ DASHBOARD_HTML = """<!doctype html>
             const title = `${decision.symbol} $${px(preview.strike)} ${preview.option_type || ''}`;
             const warnings = preview.warnings && preview.warnings.length ? `<div class="contract-warning">${preview.warnings.map(esc).join(' / ')}</div>` : '';
             const oneContract = preview.minimum_one_contract ? '<div class="contract-warning">Minimum 1 contract sizing override</div>' : '';
+            const preflight = preview.entry_preflight;
+            const quoteAge = preflight && preflight.quote_age_seconds != null ? `${Number(preflight.quote_age_seconds).toFixed(0)}s` : '-';
+            const preflightLine = preflight ? `<div class="contract-note">Entry preflight ${preflight.ok ? 'OK' : 'blocked'} / quote age ${quoteAge}</div>` : '';
             return `<div class="contract-preview ${esc(status)}">
                 <div class="contract-title">${esc(preview.symbol)}</div>
                 <div class="contract-subtitle">${esc(title)} exp ${expiry(preview.expiration)}</div>
@@ -506,7 +511,7 @@ DASHBOARD_HTML = """<!doctype html>
                 </div>
                 <div class="contract-note">${esc(status)} / ${usd(preview.allocation_amount)} allocation / ${usd(preview.account_balance)} balance</div>
                 <div class="contract-note">${esc(preview.reason || '')} / candidates ${esc(preview.candidate_count || 0)}</div>
-                ${oneContract}${warnings}
+                ${preflightLine}${oneContract}${warnings}
             </div>`;
         }
         function contractText(row) {
@@ -584,7 +589,8 @@ DASHBOARD_HTML = """<!doctype html>
                 `Mode ${data.bot.paper ? 'paper' : 'live'}`,
                 `Entry ${esc(data.bot.entry_window)}`,
                 `Refresh 5s`,
-                `Contracts ${shortDateTime(data.daily_context.contract_previews_refreshed_at)}`
+                `Contracts ${shortDateTime(data.daily_context.contract_previews_refreshed_at)}`,
+                `Review ${esc(data.daily_context.contract_previews_refresh_reason || '-')}`
             ].map(item => `<span class="pill">${item}</span>`).join('');
             document.getElementById('metrics').innerHTML = [
                 metric('Ready Setups', ready),
