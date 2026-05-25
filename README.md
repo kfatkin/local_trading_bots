@@ -22,9 +22,9 @@ Before the trading session, it queries the `uw-data` DynamoDB table with AWS pro
 
 For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 60% of the total directional premium.
 
-For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. Between 10:00 and 15:00 ET, a 5-minute candle must sweep a relevant low, close meaningfully back above it, and then the next 5-minute candle must confirm by holding above that level before the bot buys calls.
+For bullish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 15:00 ET, it can either buy calls after a confirmed sweep/reclaim of a watched low or after a bullish 5-minute continuation fair value gap setup forms and then confirms on the pullback.
 
-For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. Between 10:00 and 15:00 ET, a 5-minute candle must sweep a relevant high, close meaningfully back below it, and then the next 5-minute candle must confirm by holding below that level before the bot buys puts.
+For bearish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 15:00 ET, it can either buy puts after a confirmed sweep/rejection of a watched high or after a bearish 5-minute continuation fair value gap setup forms and then confirms on the pullback.
 
 Contracts are selected from the nearest active expiration, including 0DTE when available. The selector first scopes candidates to contracts within `0.15` absolute delta of the configured `0.30` target when available, builds a candidate band from the three contracts just below target delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 
@@ -33,7 +33,7 @@ Contracts are selected from the nearest active expiration, including 0DTE when a
 - Default account mode is paper trading through `ALPACA_PAPER=true` or the built-in default.
 - Position size is 5% of Alpaca account balance, using portfolio value/equity/cash before falling back to buying power.
 - If the 5% allocation cannot buy one contract, the bot can still buy one contract when that contract costs no more than 20% of account balance.
-- Stop is the sweep candle extreme.
+- Sweep entries use the sweep candle extreme as the stop. Continuation FVG entries use the structure swing that defined the break as the stop.
 - Target is bot-managed. The bot uses the closest opposing key level only when that level offers at least 2R from the underlying entry-to-stop distance; otherwise it uses a fixed 2R underlying target so trades can still run into all-time highs or lows.
 - Once the underlying reaches 1.5R, the bot switches the stop mode to option breakeven and exits if the option market price falls back to the entry option price.
 - Remaining positions are closed near end of day at 15:55 ET.
@@ -65,6 +65,9 @@ FLOW_SWEEP_BREAKEVEN_TRIGGER_R_MULTIPLE=1.5
 FLOW_SWEEP_ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT=0.50
 FLOW_SWEEP_ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT=0.10
 FLOW_SWEEP_ENTRY_MAX_TARGET_R_MULTIPLE=8.0
+FLOW_SWEEP_CONTINUATION_DISPLACEMENT_LOOKBACK=5
+FLOW_SWEEP_CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE=1.25
+FLOW_SWEEP_CONTINUATION_MAX_ZONE_AGE_BARS=6
 FLOW_SWEEP_OPTION_PREVIEW_REFRESH_SECONDS=300
 FLOW_SWEEP_OPTION_EXPIRATION_LOOKAHEAD_DAYS=21
 FLOW_SWEEP_OPTION_MAX_SPREAD_PCT=0.30

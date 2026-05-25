@@ -12,6 +12,9 @@ from .config import (
     AWS_REGION,
     CONSENSUS_THRESHOLD,
     BREAKEVEN_TRIGGER_R_MULTIPLE,
+    CONTINUATION_DISPLACEMENT_LOOKBACK,
+    CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE,
+    CONTINUATION_MAX_ZONE_AGE_BARS,
     ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
     ENTRY_MAX_TARGET_R_MULTIPLE,
     ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT,
@@ -66,6 +69,7 @@ from .utils import create_client_order_id, get_value, is_option_asset, key_level
 CONTRACT_PREVIEW_LOCK = threading.Lock()
 CONTRACT_PREVIEW_STATUSES = {"flow_bias", "flow_preview", "ready"}
 pending_sweep_confirmations = {}
+continuation_contexts = {}
 
 
 def log_startup_context():
@@ -234,12 +238,12 @@ def setup_plan_summary(setup):
     if setup.bias.direction == "bullish":
         trigger_levels = setup.support_levels
         target_levels = sorted(setup.resistance_levels, key=lambda level: level.price)
-        action = "Buy calls after a meaningful 5m sweep/reclaim and next-candle confirmation"
+        action = "Buy calls after either a confirmed sweep/reclaim or a bullish 5m continuation FVG pullback"
         option_type = "CALL"
     else:
         trigger_levels = setup.resistance_levels
         target_levels = sorted(setup.support_levels, key=lambda level: level.price, reverse=True)
-        action = "Buy puts after a meaningful 5m sweep/rejection and next-candle confirmation"
+        action = "Buy puts after either a confirmed sweep/rejection or a bearish 5m continuation FVG pullback"
         option_type = "PUT"
 
     return {
@@ -399,6 +403,7 @@ def prepare_daily_context(now_et=None, force=False):
         reset_daily_trade_state_if_needed(trading_day)
         if daily_context.get("session") != trading_day.isoformat():
             pending_sweep_confirmations.clear()
+            continuation_contexts.clear()
 
         prior_open = schedule.iloc[trading_idx - 1]["market_open"].to_pydatetime().astimezone(UTC)
         prior_close = schedule.iloc[trading_idx - 1]["market_close"].to_pydatetime().astimezone(UTC)
@@ -575,17 +580,225 @@ def entry_risk_quality_reason(risk_plan):
     return None
 
 
-def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
-    with STATE_LOCK:
-        if symbol in active_positions or symbol in pending_entry_orders.values():
-            return
-    if was_symbol_traded_today(symbol):
-        record_trade_event("entry_skipped", symbol=symbol, event_id=f"entry-skipped-already-traded:{symbol}", reason="symbol already traded today")
+def strong_directional_close(direction, bar):
+    width = bar_range(bar)
+    if width <= 0:
+        return False
+    if direction == "bullish":
+        return bar["close"] > bar["open"] and bar["close"] >= bar["low"] + width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT
+    return bar["close"] < bar["open"] and bar["close"] <= bar["high"] - width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT
+
+
+def trim_tail(items, limit=20):
+    if len(items) > limit:
+        del items[:-limit]
+
+
+def new_continuation_context():
+    return {"recent_bars": [], "swing_highs": [], "swing_lows": [], "active_zone": None}
+
+
+def update_continuation_swings(context):
+    bars = context["recent_bars"]
+    if len(bars) < 3:
         return
 
+    left_bar, pivot_bar, right_bar = bars[-3], bars[-2], bars[-1]
+    pivot_time = pivot_bar["close_time"]
+
+    if left_bar["high"] < pivot_bar["high"] > right_bar["high"]:
+        swing_highs = context["swing_highs"]
+        if not swing_highs or swing_highs[-1]["close_time"] != pivot_time:
+            swing_highs.append({"price": round(float(pivot_bar["high"]), 4), "close_time": pivot_time})
+            trim_tail(swing_highs)
+
+    if left_bar["low"] > pivot_bar["low"] < right_bar["low"]:
+        swing_lows = context["swing_lows"]
+        if not swing_lows or swing_lows[-1]["close_time"] != pivot_time:
+            swing_lows.append({"price": round(float(pivot_bar["low"]), 4), "close_time": pivot_time})
+            trim_tail(swing_lows)
+
+
+def latest_pivot_before(points, before_time):
+    for point in reversed(points):
+        if point["close_time"] < before_time:
+            return point
+    return None
+
+
+def latest_pivot_between(points, after_time, before_time):
+    for point in reversed(points):
+        if after_time < point["close_time"] < before_time:
+            return point
+    return None
+
+
+def average_prior_range(recent_bars):
+    if len(recent_bars) < 2:
+        return 0.0
+    lookback_slice = recent_bars[-(CONTINUATION_DISPLACEMENT_LOOKBACK + 1) : -1]
+    if not lookback_slice:
+        return 0.0
+    return sum(bar_range(item) for item in lookback_slice) / len(lookback_slice)
+
+
+def build_continuation_zone(setup, context, bar):
+    recent_bars = context["recent_bars"]
+    if len(recent_bars) < 3:
+        return None
+
+    prior_range = average_prior_range(recent_bars)
+    if prior_range <= 0:
+        return None
+    if bar_range(bar) < prior_range * CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE:
+        return None
+    if not strong_directional_close(setup.bias.direction, bar):
+        return None
+
+    anchor_bar = recent_bars[-3]
+    if setup.bias.direction == "bullish":
+        break_pivot = latest_pivot_before(context["swing_highs"], bar["close_time"])
+        if not break_pivot or bar["close"] <= break_pivot["price"]:
+            return None
+        structure_pivot = latest_pivot_between(context["swing_lows"], break_pivot["close_time"], bar["close_time"])
+        if not structure_pivot or bar["low"] <= anchor_bar["high"]:
+            return None
+        zone_low = round(float(anchor_bar["high"]), 4)
+        zone_high = round(float(bar["low"]), 4)
+    else:
+        break_pivot = latest_pivot_before(context["swing_lows"], bar["close_time"])
+        if not break_pivot or bar["close"] >= break_pivot["price"]:
+            return None
+        structure_pivot = latest_pivot_between(context["swing_highs"], break_pivot["close_time"], bar["close_time"])
+        if not structure_pivot or bar["high"] >= anchor_bar["low"]:
+            return None
+        zone_low = round(float(bar["high"]), 4)
+        zone_high = round(float(anchor_bar["low"]), 4)
+
+    return {
+        "setup_type": "continuation_fvg",
+        "signal_name": "continuation_fvg",
+        "direction": setup.bias.direction,
+        "zone_low": min(zone_low, zone_high),
+        "zone_high": max(zone_low, zone_high),
+        "break_level_price": break_pivot["price"],
+        "break_level_time": break_pivot["close_time"],
+        "structure_price": structure_pivot["price"],
+        "structure_time": structure_pivot["close_time"],
+        "armed_at": bar["close_time"],
+        "signal_bar": bar.copy(),
+        "age_bars": 0,
+    }
+
+
+def continuation_zone_status(setup, zone, bar):
+    if setup.bias.direction == "bullish":
+        if bar["low"] <= zone["structure_price"]:
+            return "invalidated", "continuation structure low failed"
+    else:
+        if bar["high"] >= zone["structure_price"]:
+            return "invalidated", "continuation structure high failed"
+
+    touched_zone = bar["low"] <= zone["zone_high"] and bar["high"] >= zone["zone_low"]
+    if not touched_zone:
+        return "waiting", "zone not touched"
+    if not strong_directional_close(setup.bias.direction, bar):
+        return "waiting", "touch bar lacked directional confirmation"
+
+    zone_mid = (zone["zone_low"] + zone["zone_high"]) / 2
+    if setup.bias.direction == "bullish" and bar["close"] < zone_mid:
+        return "waiting", "touch bar closed below the FVG midpoint"
+    if setup.bias.direction == "bearish" and bar["close"] > zone_mid:
+        return "waiting", "touch bar closed above the FVG midpoint"
+    return "ready", "confirmed"
+
+
+def age_active_continuation_zone(context):
+    zone = context.get("active_zone")
+    if not zone:
+        return None
+    zone["age_bars"] += 1
+    if zone["age_bars"] > CONTINUATION_MAX_ZONE_AGE_BARS:
+        context["active_zone"] = None
+        return zone
+    return None
+
+
+def sweep_entry_metadata(setup, swept_level, signal_bar, sweep_bar):
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
-    stop_bar = sweep_bar or signal_bar
-    stop_underlying = stop_bar["low"] if option_type == "CALL" else stop_bar["high"]
+    stop_underlying = sweep_bar["low"] if option_type == "CALL" else sweep_bar["high"]
+    return {
+        "setup_type": "flow_sweep",
+        "signal_name": swept_level.name,
+        "signal_price": swept_level.price,
+        "signal_label": f"confirmed {swept_level.name} sweep",
+        "stop_underlying": stop_underlying,
+        "stop_mode": "underlying_sweep_extreme",
+        "signal_time": sweep_bar.get("close_time"),
+        "position_fields": {
+            "swept_level": swept_level.name,
+            "swept_level_price": swept_level.price,
+            "sweep_signal_close_time": sweep_bar["close_time"].isoformat() if sweep_bar.get("close_time") else None,
+            "entry_confirmation_close_time": signal_bar["close_time"].isoformat() if signal_bar.get("close_time") else None,
+        },
+        "event_fields": {
+            "swept_level": swept_level.name,
+            "swept_level_price": swept_level.price,
+            "sweep_signal_close_time": sweep_bar.get("close_time"),
+            "entry_confirmation_close_time": signal_bar.get("close_time"),
+        },
+    }
+
+
+def continuation_entry_metadata(zone, signal_bar):
+    signal_price = round((zone["zone_low"] + zone["zone_high"]) / 2, 4)
+    return {
+        "setup_type": zone["setup_type"],
+        "signal_name": zone["signal_name"],
+        "signal_price": signal_price,
+        "signal_label": "continuation FVG",
+        "stop_underlying": zone["structure_price"],
+        "stop_mode": "underlying_structure_swing",
+        "signal_time": zone.get("armed_at"),
+        "position_fields": {
+            "swept_level": zone["signal_name"],
+            "swept_level_price": signal_price,
+            "continuation_zone_low": zone["zone_low"],
+            "continuation_zone_high": zone["zone_high"],
+            "continuation_break_level": zone["break_level_price"],
+            "continuation_structure_price": zone["structure_price"],
+            "continuation_signal_close_time": zone["armed_at"].isoformat() if zone.get("armed_at") else None,
+            "entry_confirmation_close_time": signal_bar["close_time"].isoformat() if signal_bar.get("close_time") else None,
+        },
+        "event_fields": {
+            "continuation_zone_low": zone["zone_low"],
+            "continuation_zone_high": zone["zone_high"],
+            "continuation_break_level": zone["break_level_price"],
+            "continuation_structure_price": zone["structure_price"],
+            "continuation_signal_close_time": zone.get("armed_at"),
+            "entry_confirmation_close_time": signal_bar.get("close_time"),
+        },
+    }
+
+
+def execute_entry(symbol, setup, signal_bar, entry_metadata):
+    with STATE_LOCK:
+        if symbol in active_positions or symbol in pending_entry_orders.values():
+            return False
+    if was_symbol_traded_today(symbol):
+        record_trade_event("entry_skipped", symbol=symbol, event_id=f"entry-skipped-already-traded:{symbol}", reason="symbol already traded today")
+        return False
+
+    option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
+    setup_type = entry_metadata["setup_type"]
+    signal_name = entry_metadata["signal_name"]
+    signal_price = entry_metadata.get("signal_price")
+    signal_label = entry_metadata.get("signal_label", signal_name)
+    stop_underlying = float(entry_metadata["stop_underlying"])
+    signal_time = entry_metadata.get("signal_time")
+    stop_mode = entry_metadata.get("stop_mode", "underlying_sweep_extreme")
+    position_fields = dict(entry_metadata.get("position_fields") or {})
+    event_fields = dict(entry_metadata.get("event_fields") or {})
     target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop_underlying)
     if not target_level or not risk_plan:
         LOGGER.info(
@@ -597,14 +810,18 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
         record_trade_event(
             "entry_skipped",
             symbol=symbol,
+            setup_type=setup_type,
             option_type=option_type,
             reason="invalid risk distance",
             entry_underlying=signal_bar["close"],
             stop_underlying=stop_underlying,
-            swept_level=swept_level.name,
-            swept_level_price=swept_level.price,
+            swept_level=signal_name,
+            swept_level_price=signal_price,
+            signal_name=signal_name,
+            signal_price=signal_price,
+            **event_fields,
         )
-        return
+        return False
 
     quality_reason = entry_risk_quality_reason(risk_plan)
     if quality_reason:
@@ -612,6 +829,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
         record_trade_event(
             "entry_skipped",
             symbol=symbol,
+            setup_type=setup_type,
             option_type=option_type,
             reason=quality_reason,
             entry_underlying=signal_bar["close"],
@@ -619,10 +837,13 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             target_underlying=target_level.price,
             target_name=target_level.name,
             target_r_multiple=risk_plan.get("target_r_multiple"),
-            swept_level=swept_level.name,
-            swept_level_price=swept_level.price,
+            swept_level=signal_name,
+            swept_level_price=signal_price,
+            signal_name=signal_name,
+            signal_price=signal_price,
+            **event_fields,
         )
-        return
+        return False
 
     contract = build_fresh_entry_contract(symbol, option_type)
     preflight = validate_entry_contract(contract, require_market_open=True)
@@ -639,7 +860,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             blocking=preflight.get("blocking"),
             warnings=preflight.get("warnings"),
         )
-        return
+        return False
     if contract.get("status") != "ready" or contract.get("quantity", 0) < 1:
         LOGGER.info("Skipping %s: no usable %s contract preview. status=%s reason=%s", symbol, option_type, contract.get("status"), contract.get("reason"))
         record_trade_event(
@@ -650,15 +871,16 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             reason=contract.get("reason"),
             status=contract.get("status"),
         )
-        return
+        return False
 
     qty = to_int_qty(contract.get("quantity", 0))
+    signal_text = f"{signal_name} {signal_price:.2f}" if signal_price is not None else signal_name
     LOGGER.info(
-        "ENTER %s %s after confirmed %s sweep %.2f entry close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
+        "ENTER %s %s via %s (%s) entry close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
         symbol,
         option_type,
-        swept_level.name,
-        swept_level.price,
+        signal_label,
+        signal_text,
         signal_bar["close"],
         stop_underlying,
         target_level.name,
@@ -694,7 +916,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             qty=qty,
             reason=str(exc),
         )
-        return
+        return False
 
     order_id = str(order.id)
     with STATE_LOCK:
@@ -702,12 +924,13 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
         active_positions[symbol] = {
             "managed": True,
             "symbol": symbol,
+            "setup_type": setup_type,
             "option_symbol": contract["symbol"],
             "option_type": option_type,
             "entry_underlying": signal_bar["close"],
             "initial_stop_underlying": stop_underlying,
             "stop_underlying": stop_underlying,
-            "stop_mode": "underlying_sweep_extreme",
+            "stop_mode": stop_mode,
             "target_underlying": target_level.price,
             "target_name": target_level.name,
             "target_exit_method": "market_on_underlying_target",
@@ -716,8 +939,10 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             "breakeven_active": False,
             "breakeven_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
             "breakeven_stop_option_price": contract.get("ask"),
-            "swept_level": swept_level.name,
-            "swept_level_price": swept_level.price,
+            "swept_level": signal_name,
+            "swept_level_price": signal_price,
+            "signal_name": signal_name,
+            "signal_price": signal_price,
             "entry_order_id": order_id,
             "entry_status": "submitted",
             "entry_option_delta": contract.get("delta"),
@@ -730,9 +955,9 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             "entry_preflight": preflight,
             "total_qty": 0,
             "requested_qty": qty,
-            "sweep_signal_close_time": stop_bar["close_time"].isoformat() if stop_bar.get("close_time") else None,
-            "entry_confirmation_close_time": signal_bar["close_time"].isoformat() if sweep_bar and signal_bar.get("close_time") else None,
+            "signal_time": signal_time.isoformat() if hasattr(signal_time, "isoformat") else signal_time,
             "entry_submitted_at": datetime.now(UTC).isoformat(),
+            **position_fields,
         }
         mark_symbol_traded(symbol)
         record_trade_event_locked(
@@ -740,6 +965,7 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             symbol=symbol,
             event_id=f"entry-submitted:{order_id}",
             order_id=order_id,
+            setup_type=setup_type,
             option_symbol=contract["symbol"],
             option_type=option_type,
             qty=qty,
@@ -750,17 +976,20 @@ def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
             target_underlying=target_level.price,
             target_name=target_level.name,
             target_r_multiple=risk_plan.get("target_r_multiple"),
-            swept_level=swept_level.name,
-            swept_level_price=swept_level.price,
-            sweep_signal_close_time=stop_bar["close_time"] if stop_bar.get("close_time") else None,
-            entry_confirmation_close_time=signal_bar["close_time"] if sweep_bar and signal_bar.get("close_time") else None,
+            swept_level=signal_name,
+            swept_level_price=signal_price,
+            signal_name=signal_name,
+            signal_price=signal_price,
+            signal_time=signal_time,
             ask=contract.get("ask"),
             delta=contract.get("delta"),
             preflight_ok=preflight.get("ok"),
+            **event_fields,
         )
         persist_state_locked()
 
     LOGGER.info("Submitted entry order %s for %sx %s", order_id, qty, contract["symbol"])
+    return True
 
 
 def execute_exit(symbol, exit_qty, reason):
@@ -1123,6 +1352,7 @@ def process_completed_five_minute_bar(symbol, bar):
     close_clock = bar["close_time"].time()
     if close_clock > ENTRY_WINDOW_END:
         pending_sweep_confirmations.pop(symbol, None)
+        continuation_contexts.pop(symbol, None)
         return
     if close_clock < ENTRY_WINDOW_START:
         return
@@ -1130,24 +1360,120 @@ def process_completed_five_minute_bar(symbol, bar):
     setup = current_setup(symbol)
     if not setup or was_symbol_traded_today(symbol):
         pending_sweep_confirmations.pop(symbol, None)
+        continuation_contexts.pop(symbol, None)
         return
+
+    context = continuation_contexts.setdefault(symbol, new_continuation_context())
+    candidates = []
 
     pending = pending_sweep_confirmations.pop(symbol, None)
     if pending:
         ready, reason = confirmation_entry_ready(setup, pending["swept_level"], pending["signal_bar"], bar)
         if ready:
-            execute_entry(symbol, setup, pending["swept_level"], bar, sweep_bar=pending["signal_bar"])
-            return
-        LOGGER.info("%s sweep confirmation failed: %s", symbol, reason)
+            candidates.append(
+                {
+                    "armed_at": pending["signal_bar"].get("close_time"),
+                    "metadata": sweep_entry_metadata(setup, pending["swept_level"], bar, pending["signal_bar"]),
+                }
+            )
+        else:
+            LOGGER.info("%s sweep confirmation failed: %s", symbol, reason)
+            record_trade_event(
+                "entry_skipped",
+                symbol=symbol,
+                event_id=f"entry-confirmation-failed:{symbol}:{pending['signal_bar']['close_time'].isoformat()}",
+                setup_type="flow_sweep",
+                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+                reason=f"sweep confirmation failed: {reason}",
+                swept_level=pending["swept_level"].name,
+                swept_level_price=pending["swept_level"].price,
+                sweep_signal_close_time=pending["signal_bar"].get("close_time"),
+            )
+
+    active_zone = context.get("active_zone")
+    if active_zone:
+        status, reason = continuation_zone_status(setup, active_zone, bar)
+        if status == "ready":
+            candidates.append({"armed_at": active_zone.get("armed_at"), "metadata": continuation_entry_metadata(active_zone, bar)})
+        elif status == "invalidated":
+            LOGGER.info("%s continuation FVG invalidated: %s", symbol, reason)
+            record_trade_event(
+                "entry_skipped",
+                symbol=symbol,
+                event_id=f"entry-continuation-invalidated:{symbol}:{active_zone['armed_at'].isoformat()}",
+                setup_type="continuation_fvg",
+                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+                reason=reason,
+                swept_level=active_zone["signal_name"],
+                swept_level_price=round((active_zone["zone_low"] + active_zone["zone_high"]) / 2, 4),
+                continuation_zone_low=active_zone["zone_low"],
+                continuation_zone_high=active_zone["zone_high"],
+                continuation_structure_price=active_zone["structure_price"],
+                continuation_signal_close_time=active_zone.get("armed_at"),
+            )
+            context["active_zone"] = None
+
+    if candidates:
+        candidates.sort(
+            key=lambda item: (
+                item["armed_at"].isoformat() if hasattr(item.get("armed_at"), "isoformat") else "9999-12-31T23:59:59+00:00",
+                item["metadata"].get("setup_type") != "flow_sweep",
+            )
+        )
+        for candidate in candidates:
+            if execute_entry(symbol, setup, bar, candidate["metadata"]):
+                pending_sweep_confirmations.pop(symbol, None)
+                continuation_contexts.pop(symbol, None)
+                return
+
+    expired_zone = age_active_continuation_zone(context)
+    if expired_zone:
+        LOGGER.info("%s continuation FVG expired without entry after %s bars", symbol, expired_zone["age_bars"])
         record_trade_event(
             "entry_skipped",
             symbol=symbol,
-            event_id=f"entry-confirmation-failed:{symbol}:{pending['signal_bar']['close_time'].isoformat()}",
+            event_id=f"entry-continuation-expired:{symbol}:{expired_zone['armed_at'].isoformat()}",
+            setup_type="continuation_fvg",
             option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-            reason=f"sweep confirmation failed: {reason}",
-            swept_level=pending["swept_level"].name,
-            swept_level_price=pending["swept_level"].price,
-            sweep_signal_close_time=pending["signal_bar"].get("close_time"),
+            reason="continuation FVG expired before a valid touch-and-close entry",
+            swept_level=expired_zone["signal_name"],
+            swept_level_price=round((expired_zone["zone_low"] + expired_zone["zone_high"]) / 2, 4),
+            continuation_zone_low=expired_zone["zone_low"],
+            continuation_zone_high=expired_zone["zone_high"],
+            continuation_structure_price=expired_zone["structure_price"],
+            continuation_signal_close_time=expired_zone.get("armed_at"),
+        )
+
+    context["recent_bars"].append(bar.copy())
+    trim_tail(context["recent_bars"])
+    update_continuation_swings(context)
+
+    new_zone = build_continuation_zone(setup, context, bar)
+    if new_zone and (not context.get("active_zone") or new_zone["armed_at"] >= context["active_zone"]["armed_at"]):
+        context["active_zone"] = new_zone
+        LOGGER.info(
+            "%s %s continuation FVG armed %.2f-%.2f with structure %.2f at %s",
+            symbol,
+            setup.bias.direction,
+            new_zone["zone_low"],
+            new_zone["zone_high"],
+            new_zone["structure_price"],
+            new_zone["armed_at"],
+        )
+        record_trade_event(
+            "entry_signal",
+            symbol=symbol,
+            event_id=f"entry-continuation-signal:{symbol}:{new_zone['armed_at'].isoformat()}",
+            setup_type="continuation_fvg",
+            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+            swept_level=new_zone["signal_name"],
+            swept_level_price=round((new_zone["zone_low"] + new_zone["zone_high"]) / 2, 4),
+            continuation_zone_low=new_zone["zone_low"],
+            continuation_zone_high=new_zone["zone_high"],
+            continuation_break_level=new_zone["break_level_price"],
+            continuation_structure_price=new_zone["structure_price"],
+            continuation_signal_close_time=new_zone.get("armed_at"),
+            reason="bullish continuation FVG armed" if setup.bias.direction == "bullish" else "bearish continuation FVG armed",
         )
 
     swept_level = swept_level_for_bar(setup, bar)
@@ -1165,6 +1491,7 @@ def process_completed_five_minute_bar(symbol, bar):
             "entry_signal",
             symbol=symbol,
             event_id=f"entry-signal:{symbol}:{bar['close_time'].isoformat()}",
+            setup_type="flow_sweep",
             option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
             swept_level=swept_level.name,
             swept_level_price=swept_level.price,

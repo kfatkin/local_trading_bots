@@ -9,6 +9,7 @@
   - puts: close in the lower half and at least 10% of candle range below the swept resistance.
 - Keep the stop at the original sweep candle extreme, not the confirmation candle extreme.
 - Skip entries where the planned opposing-level target is above 8R, which usually means the risk is too tight or the nearest opposing level is too far away for this scalp structure.
+- Add a continuation fair value gap strategy as an alternative, bias-aligned setup. The live bot and backtest now allow both strategies, with the first valid armed setup winning for a symbol.
 
 ## Next Improvements To Test
 
@@ -26,9 +27,9 @@
 - The new rules intentionally reduce trade count to favor cleaner acceptance after a level sweep.
 - Expanding the confirmed-entry window from 10:00-10:30 ET to 10:00-15:00 ET improved the 40-session test to 13 trades, 5 wins, 6 losses, 2 breakeven exits, 2.31 profit factor, and +7.83R total.
 
-## Continuation FVG / Order Block Strategy Candidate
+## Continuation FVG Strategy
 
-This model is intended to complement the level-sweep strategy, not replace it outright. The flow bias still comes first: only look for bullish continuation when prior-session scored flow is bullish, and only look for bearish continuation when prior-session scored flow is bearish.
+This model complements the level-sweep strategy rather than replacing it. The flow bias still comes first: only look for bullish continuation when prior-session scored flow is bullish, and only look for bearish continuation when prior-session scored flow is bearish.
 
 ### Bullish Continuation
 
@@ -37,9 +38,8 @@ This model is intended to complement the level-sweep strategy, not replace it ou
 3. Require bullish structure to form: price makes a swing low, then breaks and closes above the most recent confirmed swing high.
 4. Require displacement on the break candle: above-average 5-minute range/body and a close in the upper part of the candle.
 5. Identify the bullish fair value gap from the displacement leg, using the three-candle pattern where the current candle low is above the high from two candles earlier.
-6. Optionally identify the bullish order block as the last bearish candle before the displacement break.
-7. Buy calls on the first pullback into the FVG or order-block zone if price holds above the structure low.
-8. Stop goes below the order block, FVG, or most recent swing low. Target uses the nearest opposing key level when it offers at least 2R, otherwise fixed 2R.
+6. Buy calls on the first pullback into the FVG if price touches the zone and then closes back in the bullish direction.
+7. Stop goes below the most recent structure swing low. Target uses the nearest opposing key level when it offers at least 2R, otherwise fixed 2R.
 
 ### Bearish Continuation
 
@@ -48,9 +48,8 @@ This model is intended to complement the level-sweep strategy, not replace it ou
 3. Require bearish structure to form: price makes a swing high, then breaks and closes below the most recent confirmed swing low.
 4. Require displacement on the break candle: above-average 5-minute range/body and a close in the lower part of the candle.
 5. Identify the bearish fair value gap from the displacement leg, using the three-candle pattern where the current candle high is below the low from two candles earlier.
-6. Optionally identify the bearish order block as the last bullish candle before the displacement break.
-7. Buy puts on the first pullback into the FVG or order-block zone if price holds below the structure high.
-8. Stop goes above the order block, FVG, or most recent swing high. Target uses the nearest opposing key level when it offers at least 2R, otherwise fixed 2R.
+6. Buy puts on the first pullback into the FVG if price touches the zone and then closes back in the bearish direction.
+7. Stop goes above the most recent structure swing high. Target uses the nearest opposing key level when it offers at least 2R, otherwise fixed 2R.
 
 ### Mechanical Definitions To Backtest
 
@@ -65,7 +64,6 @@ This model is intended to complement the level-sweep strategy, not replace it ou
 
 ### Backtest Plan
 
-- Add a separate `structure_fvg` setup type to the backtest output so level sweeps and continuation entries can be compared directly.
-- Test FVG-only entries, order-block-only entries, and a combined FVG/OB zone entry.
-- Compare trade count, win rate, profit factor, average R, max stop-out streak, and time-of-day distribution against the level-sweep model.
-- Only promote the structure model to live trading if it improves trade count without bringing back the high stop-out rate seen in the first 09:45 sweep model.
+- The combined backtest should emit `setup_type` on every row so level sweeps and continuation entries can be compared directly.
+- Compare trade count, win rate, profit factor, average R, max stop-out streak, and time-of-day distribution against the prior sweep-only model.
+- If the continuation model adds trade count but weakens expectancy, tighten the displacement and zone-age thresholds before adding more setup types.

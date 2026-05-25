@@ -32,11 +32,19 @@ from flow_sweep.flow_data import query_flow_scores, summarize_flow_rows  # noqa:
 from flow_sweep.market_data import daily_bars, get_schedule, intraday_bars, previous_calendar_week_sessions  # noqa: E402
 from flow_sweep.strategy import (  # noqa: E402
     apply_level_roles,
+    age_active_continuation_zone,
+    build_continuation_zone,
     confirmation_entry_ready,
+    continuation_entry_metadata,
+    continuation_zone_status,
     entry_risk_quality_reason,
+    new_continuation_context,
     setup_from_key_levels,
+    sweep_entry_metadata,
     swept_level_for_bar,
     target_level_for_entry,
+    trim_tail,
+    update_continuation_swings,
 )
 
 
@@ -329,6 +337,7 @@ def backtest_symbol(symbol, schedule, session_indices):
 
         entry_found = False
         pending_signal = None
+        continuation_context = new_continuation_context()
         for bar_index, (_timestamp, row) in enumerate(bars.iterrows()):
             signal_bar = bar_dict(row)
             close_clock = signal_bar["close_time"].time()
@@ -338,26 +347,80 @@ def backtest_symbol(symbol, schedule, session_indices):
             if close_clock < ENTRY_WINDOW_START:
                 continue
 
+            candidates = []
             if pending_signal:
                 swept = pending_signal["swept_level"]
                 sweep_bar = pending_signal["signal_bar"]
                 ready, confirmation_reason = confirmation_entry_ready(setup, swept, sweep_bar, signal_bar)
                 if ready:
-                    option_type = "CALL" if bias.direction == "bullish" else "PUT"
-                    stop = sweep_bar["low"] if option_type == "CALL" else sweep_bar["high"]
+                    candidates.append(
+                        {
+                            "armed_at": sweep_bar["close_time"],
+                            "metadata": sweep_entry_metadata(setup, swept, signal_bar, sweep_bar),
+                        }
+                    )
+                else:
+                    rows.append(
+                        {
+                            **base,
+                            "status": "SKIPPED",
+                            "setup_type": "flow_sweep",
+                            "reason": f"Confirmation failed: {confirmation_reason}",
+                            "sweep_signal_time": sweep_bar["close_time"].isoformat(),
+                            "entry_time": signal_bar["close_time"].isoformat(),
+                            "swept_level": swept.name,
+                            "swept_level_price": swept.price,
+                        }
+                    )
+                pending_signal = None
+
+            active_zone = continuation_context.get("active_zone")
+            if active_zone:
+                zone_status, zone_reason = continuation_zone_status(setup, active_zone, signal_bar)
+                if zone_status == "ready":
+                    candidates.append({"armed_at": active_zone["armed_at"], "metadata": continuation_entry_metadata(active_zone, signal_bar)})
+                elif zone_status == "invalidated":
+                    rows.append(
+                        {
+                            **base,
+                            "status": "SKIPPED",
+                            "setup_type": "continuation_fvg",
+                            "reason": zone_reason,
+                            "sweep_signal_time": active_zone["armed_at"].isoformat(),
+                            "entry_time": signal_bar["close_time"].isoformat(),
+                            "swept_level": active_zone["signal_name"],
+                            "swept_level_price": round((active_zone["zone_low"] + active_zone["zone_high"]) / 2, 4),
+                            "continuation_zone_low": active_zone["zone_low"],
+                            "continuation_zone_high": active_zone["zone_high"],
+                            "continuation_structure_price": active_zone["structure_price"],
+                        }
+                    )
+                    continuation_context["active_zone"] = None
+
+            if candidates:
+                candidates.sort(
+                    key=lambda item: (
+                        item["armed_at"].isoformat() if hasattr(item.get("armed_at"), "isoformat") else "9999-12-31T23:59:59+00:00",
+                        item["metadata"].get("setup_type") != "flow_sweep",
+                    )
+                )
+                option_type = "CALL" if bias.direction == "bullish" else "PUT"
+                for candidate in candidates:
+                    metadata = candidate["metadata"]
+                    stop = float(metadata["stop_underlying"])
                     target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop)
                     if not target_level or not risk_plan:
                         rows.append(
                             {
                                 **base,
                                 "status": "SKIPPED",
+                                "setup_type": metadata["setup_type"],
                                 "reason": "Invalid entry/stop risk",
                                 "entry_time": signal_bar["close_time"].isoformat(),
-                                "swept_level": swept.name,
-                                "swept_level_price": swept.price,
+                                "swept_level": metadata["signal_name"],
+                                "swept_level_price": metadata.get("signal_price"),
                             }
                         )
-                        pending_signal = None
                         continue
 
                     quality_reason = entry_risk_quality_reason(risk_plan)
@@ -366,18 +429,18 @@ def backtest_symbol(symbol, schedule, session_indices):
                             {
                                 **base,
                                 "status": "SKIPPED",
+                                "setup_type": metadata["setup_type"],
                                 "reason": quality_reason,
                                 "entry_time": signal_bar["close_time"].isoformat(),
                                 "entry_price": round(signal_bar["close"], 4),
                                 "stop_price": round(stop, 4),
-                                "swept_level": swept.name,
-                                "swept_level_price": swept.price,
+                                "swept_level": metadata["signal_name"],
+                                "swept_level_price": metadata.get("signal_price"),
                                 "target_name": target_level.name,
                                 "target_price": round(target_level.price, 4),
                                 "target_r": risk_plan["target_r_multiple"],
                             }
                         )
-                        pending_signal = None
                         continue
 
                     exit_result = simulate_exit(
@@ -390,18 +453,18 @@ def backtest_symbol(symbol, schedule, session_indices):
                         risk_plan["breakeven_trigger_underlying"],
                     )
                     if not exit_result:
-                        rows.append({**base, "status": "SKIPPED", "reason": "Invalid simulated risk"})
-                        pending_signal = None
+                        rows.append({**base, "status": "SKIPPED", "setup_type": metadata["setup_type"], "reason": "Invalid simulated risk"})
                         continue
 
                     rows.append(
                         {
                             **base,
                             "status": "TRADE",
+                            "setup_type": metadata["setup_type"],
                             "option_type": option_type,
-                            "swept_level": swept.name,
-                            "swept_level_price": swept.price,
-                            "sweep_signal_time": sweep_bar["close_time"].isoformat(),
+                            "swept_level": metadata["signal_name"],
+                            "swept_level_price": metadata.get("signal_price"),
+                            "sweep_signal_time": metadata.get("signal_time").isoformat() if hasattr(metadata.get("signal_time"), "isoformat") else metadata.get("signal_time"),
                             "entry_time": signal_bar["close_time"].isoformat(),
                             "entry_price": round(signal_bar["close"], 4),
                             "stop_price": round(stop, 4),
@@ -415,23 +478,39 @@ def backtest_symbol(symbol, schedule, session_indices):
                             "exit_reason": exit_result["exit_reason"],
                             "r_multiple": round(exit_result["r_multiple"], 4),
                             "breakeven_active": exit_result["breakeven_active"],
+                            **(metadata.get("event_fields") or {}),
                         }
                     )
                     entry_found = True
                     break
 
+                if entry_found:
+                    break
+
+            expired_zone = age_active_continuation_zone(continuation_context)
+            if expired_zone:
                 rows.append(
                     {
                         **base,
                         "status": "SKIPPED",
-                        "reason": f"Confirmation failed: {confirmation_reason}",
-                        "sweep_signal_time": sweep_bar["close_time"].isoformat(),
-                        "entry_time": signal_bar["close_time"].isoformat(),
-                        "swept_level": swept.name,
-                        "swept_level_price": swept.price,
+                        "setup_type": "continuation_fvg",
+                        "reason": "Continuation FVG expired before a valid touch-and-close entry",
+                        "sweep_signal_time": expired_zone["armed_at"].isoformat(),
+                        "swept_level": expired_zone["signal_name"],
+                        "swept_level_price": round((expired_zone["zone_low"] + expired_zone["zone_high"]) / 2, 4),
+                        "continuation_zone_low": expired_zone["zone_low"],
+                        "continuation_zone_high": expired_zone["zone_high"],
+                        "continuation_structure_price": expired_zone["structure_price"],
                     }
                 )
-                pending_signal = None
+
+            continuation_context["recent_bars"].append(signal_bar.copy())
+            trim_tail(continuation_context["recent_bars"])
+            update_continuation_swings(continuation_context)
+
+            new_zone = build_continuation_zone(setup, continuation_context, signal_bar)
+            if new_zone and (not continuation_context.get("active_zone") or new_zone["armed_at"] >= continuation_context["active_zone"]["armed_at"]):
+                continuation_context["active_zone"] = new_zone
 
             swept = swept_level_for_bar(setup, signal_bar)
             if not swept:
@@ -440,7 +519,7 @@ def backtest_symbol(symbol, schedule, session_indices):
             pending_signal = {"swept_level": swept, "signal_bar": signal_bar, "bar_index": bar_index}
 
         if not entry_found:
-            rows.append({**base, "status": "NO_ENTRY", "reason": "No confirmed 5m sweep/reclaim in entry window"})
+            rows.append({**base, "status": "NO_ENTRY", "reason": "No confirmed sweep or continuation FVG entry in entry window"})
 
     return rows
 
@@ -503,6 +582,7 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
     by_symbol = summarize_by_symbol(rows)
     status_counts = pd.Series([row.get("status") for row in rows]).value_counts().to_dict()
     exit_counts = pd.Series([row.get("exit_reason") for row in rows if row.get("status") == "TRADE"]).value_counts().to_dict()
+    setup_counts = pd.Series([row.get("setup_type", "unknown") for row in rows if row.get("status") == "TRADE"]).value_counts().to_dict()
 
     lines = [
         "# Flow Sweep Backtest",
@@ -515,7 +595,9 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         "",
         "- Uses UW scored-flow rows from each prior regular session and underlying OHLC price data for the tested session.",
         f"- Entries are only considered from {ENTRY_WINDOW_START.strftime('%H:%M')} through {ENTRY_WINDOW_END.strftime('%H:%M')} ET.",
-        "- Entry requires a meaningful sweep/reclaim candle followed by one confirming 5-minute candle.",
+        "- Entry can come from either the confirmed level-sweep model or the continuation FVG model, with the earliest armed valid setup winning for that symbol.",
+        "- Sweep entries require a meaningful sweep/reclaim candle followed by one confirming 5-minute candle.",
+        "- Continuation entries require a 5-minute break of structure with displacement, an armed fair value gap, and then a touch plus directional confirming close back out of the gap.",
         f"- Sweep and confirmation strength uses a {fmt_pct(ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT)} candle-range close test, and sweep candles must clear the level by at least {fmt_pct(ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT)} of candle range.",
         f"- Planned targets above {ENTRY_MAX_TARGET_R_MULTIPLE:.2f}R are skipped as low-quality/tight-risk entries.",
         "- Results are measured in underlying R multiples, not historical option premium PnL.",
@@ -532,6 +614,7 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         f"- Average R: {overall['avg_r']:.2f}",
         f"- Status counts: {status_counts}",
         f"- Exit counts: {exit_counts}",
+        f"- Setup counts: {setup_counts}",
         "",
         "## By Symbol",
         "",
@@ -548,8 +631,8 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
             "",
             "## Trade Log",
             "",
-            "| Session | Symbol | Bias | Entry | Exit | Result | Target | Flow |",
-            "|---|---|---|---|---|---:|---|---:|",
+            "| Session | Symbol | Setup | Bias | Entry | Exit | Result | Target | Flow |",
+            "|---|---|---|---|---|---|---:|---|---:|",
         ]
     )
     for row in rows:
@@ -559,7 +642,7 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         exit_text = f"{str(row.get('exit_time') or '')[-14:-6]} {row.get('exit_reason')} @ {row.get('exit_price')}"
         target = f"{row.get('target_name')} {row.get('target_price')} ({row.get('target_r')}R)"
         lines.append(
-            f"| {row['session']} | {row['symbol']} | {row.get('direction')} {row.get('option_type')} | {entry} | {exit_text} | {row.get('r_multiple'):.2f} | {target} | {row.get('flow_rows')} |"
+            f"| {row['session']} | {row['symbol']} | {row.get('setup_type', 'flow_sweep')} | {row.get('direction')} {row.get('option_type')} | {entry} | {exit_text} | {row.get('r_multiple'):.2f} | {target} | {row.get('flow_rows')} |"
         )
 
     lines.extend(
@@ -567,15 +650,15 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
             "",
             "## Non-Trade Log",
             "",
-            "| Session | Symbol | Status | Bias | Reason | Flow Rows |",
-            "|---|---|---|---|---|---:|",
+            "| Session | Symbol | Status | Setup | Bias | Reason | Flow Rows |",
+            "|---|---|---|---|---|---|---:|",
         ]
     )
     for row in rows:
         if row.get("status") == "TRADE":
             continue
         lines.append(
-            f"| {row['session']} | {row['symbol']} | {row.get('status')} | {row.get('direction')} | {row.get('reason', '')} | {row.get('flow_rows')} |"
+            f"| {row['session']} | {row['symbol']} | {row.get('status')} | {row.get('setup_type', '-')} | {row.get('direction')} | {row.get('reason', '')} | {row.get('flow_rows')} |"
         )
 
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

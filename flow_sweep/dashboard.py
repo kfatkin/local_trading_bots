@@ -175,6 +175,7 @@ def position_payload(symbol, position, broker_position=None):
     return {
         "symbol": symbol,
         "managed": bool(position.get("managed", True)),
+        "setup_type": position.get("setup_type"),
         "option_symbol": position.get("option_symbol"),
         "option_type": position.get("option_type"),
         "entry_status": position.get("entry_status"),
@@ -867,7 +868,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <td>${esc(p.total_qty)} / ${esc(p.requested_qty)}<br><span class="muted">Broker ${esc(p.broker && p.broker.qty != null ? p.broker.qty : '-')}</span></td>
                 <td>${stopPlan(p)}</td>
                 <td>${targetPlan(p)}</td>
-                <td>${esc(p.entry_status || '-')}<br><span class="muted">Swept ${esc(p.swept_level || '-')}</span></td>
+                <td>${esc(p.entry_status || '-')}<br><span class="muted">${esc(p.setup_type || 'signal')} ${esc(p.swept_level || '-')}</span></td>
             </tr>`), 'No active positions.');
             table('orders', ['Symbol', 'Side', 'Type', 'Qty', 'Status', 'Limit / Stop'], data.broker_open_orders.map(o => `<tr>
                 <td class="symbol">${esc(o.symbol || '-')}</td>
