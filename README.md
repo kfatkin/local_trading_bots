@@ -22,9 +22,9 @@ Before the trading session, it queries the `uw-data` DynamoDB table with AWS pro
 
 For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 60% of the total directional premium.
 
-For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant low and closes back above it, the bot buys calls.
+For bullish flow, the bot watches premarket low, prior-day low, and prior-week low. After 10:00 ET, a 5-minute candle must sweep a relevant low, close meaningfully back above it, and then the next 5-minute candle must confirm by holding above that level before the bot buys calls.
 
-For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. If a 5-minute candle between 09:45 and 10:30 ET sweeps the closest relevant high and closes back below it, the bot buys puts.
+For bearish flow, the bot watches premarket high, prior-day high, and prior-week high. After 10:00 ET, a 5-minute candle must sweep a relevant high, close meaningfully back below it, and then the next 5-minute candle must confirm by holding below that level before the bot buys puts.
 
 Contracts are selected from the nearest active expiration, including 0DTE when available. The selector first scopes candidates to contracts within `0.15` absolute delta of the configured `0.30` target when available, builds a candidate band from the three contracts just below target delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 
@@ -62,6 +62,9 @@ FLOW_SWEEP_TRADE_ALLOCATION_PCT=0.05
 FLOW_SWEEP_TARGET_DELTA=0.30
 FLOW_SWEEP_TARGET_R_MULTIPLE=2.0
 FLOW_SWEEP_BREAKEVEN_TRIGGER_R_MULTIPLE=1.5
+FLOW_SWEEP_ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT=0.50
+FLOW_SWEEP_ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT=0.10
+FLOW_SWEEP_ENTRY_MAX_TARGET_R_MULTIPLE=8.0
 FLOW_SWEEP_OPTION_PREVIEW_REFRESH_SECONDS=300
 FLOW_SWEEP_OPTION_EXPIRATION_LOOKAHEAD_DAYS=21
 FLOW_SWEEP_OPTION_MAX_SPREAD_PCT=0.30
@@ -104,7 +107,7 @@ http://127.0.0.1:8765
 
 The dashboard shows the current session, prior session, Alpaca account and market-clock status, flow decision for each watched symbol, all six key levels, the planned option contract, target levels, active positions, Alpaca broker open orders, pending bot orders, recent completed 5-minute bars, and the current session trade log.
 
-The key-level column lists premarket low/high, prior-day low/high, and prior-week low/high. Bullish setups mark support levels as observed for call entries after a sweep and 5-minute close back above. Bearish setups mark resistance levels as observed for put entries after a sweep and 5-minute close back below. The opposite side is shown as skipped for that setup, and upcoming-session premarket levels stay pending until they are available.
+The key-level column lists premarket low/high, prior-day low/high, and prior-week low/high. Bullish setups mark support levels as observed for call entries after a confirmed sweep/reclaim. Bearish setups mark resistance levels as observed for put entries after a confirmed sweep/rejection. The opposite side is shown as skipped for that setup, and upcoming-session premarket levels stay pending until they are available.
 
 Each watched symbol also has an expandable high-score flow row showing all prior-session `_flow_scores_trading_bot` records above the configured score threshold. These are aggregate score rows from `uw-hub`; contract columns will populate when the underlying score row includes contract fields.
 

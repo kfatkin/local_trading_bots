@@ -11,6 +11,10 @@ from .config import (
     AWS_PROFILE,
     AWS_REGION,
     CONSENSUS_THRESHOLD,
+    BREAKEVEN_TRIGGER_R_MULTIPLE,
+    ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
+    ENTRY_MAX_TARGET_R_MULTIPLE,
+    ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT,
     ENTRY_WINDOW_END,
     ENTRY_WINDOW_START,
     EOD_EXIT_TIME,
@@ -21,7 +25,6 @@ from .config import (
     OPTION_PREVIEW_REFRESH_SECONDS,
     PAPER,
     REGULAR_OPEN,
-    BREAKEVEN_TRIGGER_R_MULTIPLE,
     SYMBOLS,
     TARGET_R_MULTIPLE,
     TARGET_DELTA,
@@ -62,6 +65,7 @@ from .utils import create_client_order_id, get_value, is_option_asset, key_level
 
 CONTRACT_PREVIEW_LOCK = threading.Lock()
 CONTRACT_PREVIEW_STATUSES = {"flow_bias", "flow_preview", "ready"}
+pending_sweep_confirmations = {}
 
 
 def log_startup_context():
@@ -174,7 +178,7 @@ def apply_level_roles(levels, bias):
         return [{**level, "role": "skipped", "note": level.get("note") or "Skipped: no actionable directional bias"} for level in levels]
 
     observed_side = "support" if bias.direction == "bullish" else "resistance"
-    observed_note = "Observed for call entries after a 5m sweep and close back above" if bias.direction == "bullish" else "Observed for put entries after a 5m sweep and close back below"
+    observed_note = "Observed for call entries after a meaningful sweep/reclaim and confirming 5m candle" if bias.direction == "bullish" else "Observed for put entries after a meaningful sweep/rejection and confirming 5m candle"
     skipped_note = "Skipped for this bullish setup" if bias.direction == "bullish" else "Skipped for this bearish setup"
     role_levels = []
     for level in levels:
@@ -230,12 +234,12 @@ def setup_plan_summary(setup):
     if setup.bias.direction == "bullish":
         trigger_levels = setup.support_levels
         target_levels = sorted(setup.resistance_levels, key=lambda level: level.price)
-        action = "Buy calls after a 5m sweep below one of these lows and close back above it"
+        action = "Buy calls after a meaningful 5m sweep/reclaim and next-candle confirmation"
         option_type = "CALL"
     else:
         trigger_levels = setup.resistance_levels
         target_levels = sorted(setup.support_levels, key=lambda level: level.price, reverse=True)
-        action = "Buy puts after a 5m sweep above one of these highs and close back below it"
+        action = "Buy puts after a meaningful 5m sweep/rejection and next-candle confirmation"
         option_type = "PUT"
 
     return {
@@ -393,6 +397,8 @@ def prepare_daily_context(now_et=None, force=False):
             return
 
         reset_daily_trade_state_if_needed(trading_day)
+        if daily_context.get("session") != trading_day.isoformat():
+            pending_sweep_confirmations.clear()
 
         prior_open = schedule.iloc[trading_idx - 1]["market_open"].to_pydatetime().astimezone(UTC)
         prior_close = schedule.iloc[trading_idx - 1]["market_close"].to_pydatetime().astimezone(UTC)
@@ -502,6 +508,29 @@ def target_level_for_entry(setup, option_type, entry_price, stop_underlying):
     return target_level, risk_plan_for_entry(option_type, entry_price, stop_underlying, target_level.price)
 
 
+def bar_range(bar):
+    return max(float(bar["high"]) - float(bar["low"]), 0.0)
+
+
+def sweep_reclaim_quality_reason(setup, level, bar):
+    width = bar_range(bar)
+    if width <= 0:
+        return "zero-range sweep candle"
+
+    min_clearance = width * ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT
+    if setup.bias.direction == "bullish":
+        if bar["close"] < bar["low"] + width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT:
+            return "reclaim candle did not close in the upper half"
+        if bar["close"] - level.price < min_clearance:
+            return "reclaim close did not clear the swept level enough"
+    else:
+        if bar["close"] > bar["high"] - width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT:
+            return "rejection candle did not close in the lower half"
+        if level.price - bar["close"] < min_clearance:
+            return "rejection close did not clear the swept level enough"
+    return None
+
+
 def swept_level_for_bar(setup, bar):
     if setup.bias.direction == "bullish":
         swept = [level for level in setup.support_levels if bar["low"] < level.price and bar["close"] > level.price]
@@ -509,10 +538,44 @@ def swept_level_for_bar(setup, bar):
         swept = [level for level in setup.resistance_levels if bar["high"] > level.price and bar["close"] < level.price]
     if not swept:
         return None
-    return min(swept, key=lambda level: abs(bar["open"] - level.price))
+    qualified = [level for level in swept if not sweep_reclaim_quality_reason(setup, level, bar)]
+    if not qualified:
+        return None
+    return min(qualified, key=lambda level: abs(bar["open"] - level.price))
 
 
-def execute_entry(symbol, setup, swept_level, signal_bar):
+def confirmation_entry_ready(setup, swept_level, sweep_bar, confirmation_bar):
+    width = bar_range(confirmation_bar)
+    if width <= 0:
+        return False, "zero-range confirmation candle"
+
+    if setup.bias.direction == "bullish":
+        if confirmation_bar["low"] < swept_level.price:
+            return False, "confirmation candle did not hold above swept support"
+        strong_close = confirmation_bar["close"] >= confirmation_bar["low"] + width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT
+        broke_signal = confirmation_bar["high"] > sweep_bar["high"]
+        if not (strong_close or broke_signal):
+            return False, "confirmation candle lacked bullish follow-through"
+    else:
+        if confirmation_bar["high"] > swept_level.price:
+            return False, "confirmation candle did not hold below swept resistance"
+        strong_close = confirmation_bar["close"] <= confirmation_bar["high"] - width * ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT
+        broke_signal = confirmation_bar["low"] < sweep_bar["low"]
+        if not (strong_close or broke_signal):
+            return False, "confirmation candle lacked bearish follow-through"
+    return True, "confirmed"
+
+
+def entry_risk_quality_reason(risk_plan):
+    target_r = risk_plan.get("target_r_multiple") if risk_plan else None
+    if target_r is None:
+        return "missing risk plan"
+    if target_r > ENTRY_MAX_TARGET_R_MULTIPLE:
+        return f"planned target {target_r:.2f}R exceeds max {ENTRY_MAX_TARGET_R_MULTIPLE:.2f}R"
+    return None
+
+
+def execute_entry(symbol, setup, swept_level, signal_bar, sweep_bar=None):
     with STATE_LOCK:
         if symbol in active_positions or symbol in pending_entry_orders.values():
             return
@@ -521,6 +584,46 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         return
 
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
+    stop_bar = sweep_bar or signal_bar
+    stop_underlying = stop_bar["low"] if option_type == "CALL" else stop_bar["high"]
+    target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop_underlying)
+    if not target_level or not risk_plan:
+        LOGGER.info(
+            "Skipping %s: invalid risk distance for entry %.2f stop %.2f",
+            symbol,
+            signal_bar["close"],
+            stop_underlying,
+        )
+        record_trade_event(
+            "entry_skipped",
+            symbol=symbol,
+            option_type=option_type,
+            reason="invalid risk distance",
+            entry_underlying=signal_bar["close"],
+            stop_underlying=stop_underlying,
+            swept_level=swept_level.name,
+            swept_level_price=swept_level.price,
+        )
+        return
+
+    quality_reason = entry_risk_quality_reason(risk_plan)
+    if quality_reason:
+        LOGGER.info("Skipping %s: %s", symbol, quality_reason)
+        record_trade_event(
+            "entry_skipped",
+            symbol=symbol,
+            option_type=option_type,
+            reason=quality_reason,
+            entry_underlying=signal_bar["close"],
+            stop_underlying=stop_underlying,
+            target_underlying=target_level.price,
+            target_name=target_level.name,
+            target_r_multiple=risk_plan.get("target_r_multiple"),
+            swept_level=swept_level.name,
+            swept_level_price=swept_level.price,
+        )
+        return
+
     contract = build_fresh_entry_contract(symbol, option_type)
     preflight = validate_entry_contract(contract, require_market_open=True)
     contract["entry_preflight"] = preflight
@@ -549,29 +652,9 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
         )
         return
 
-    stop_underlying = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
-    target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop_underlying)
-    if not target_level or not risk_plan:
-        LOGGER.info(
-            "Skipping %s: invalid risk distance for entry %.2f stop %.2f",
-            symbol,
-            signal_bar["close"],
-            stop_underlying,
-        )
-        record_trade_event(
-            "entry_skipped",
-            symbol=symbol,
-            option_symbol=contract.get("symbol"),
-            option_type=option_type,
-            reason="invalid risk distance",
-            entry_underlying=signal_bar["close"],
-            stop_underlying=stop_underlying,
-        )
-        return
-
     qty = to_int_qty(contract.get("quantity", 0))
     LOGGER.info(
-        "ENTER %s %s after %s sweep %.2f close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
+        "ENTER %s %s after confirmed %s sweep %.2f entry close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
         symbol,
         option_type,
         swept_level.name,
@@ -647,6 +730,8 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             "entry_preflight": preflight,
             "total_qty": 0,
             "requested_qty": qty,
+            "sweep_signal_close_time": stop_bar["close_time"].isoformat() if stop_bar.get("close_time") else None,
+            "entry_confirmation_close_time": signal_bar["close_time"].isoformat() if sweep_bar and signal_bar.get("close_time") else None,
             "entry_submitted_at": datetime.now(UTC).isoformat(),
         }
         mark_symbol_traded(symbol)
@@ -667,6 +752,8 @@ def execute_entry(symbol, setup, swept_level, signal_bar):
             target_r_multiple=risk_plan.get("target_r_multiple"),
             swept_level=swept_level.name,
             swept_level_price=swept_level.price,
+            sweep_signal_close_time=stop_bar["close_time"] if stop_bar.get("close_time") else None,
+            entry_confirmation_close_time=signal_bar["close_time"] if sweep_bar and signal_bar.get("close_time") else None,
             ask=contract.get("ask"),
             delta=contract.get("delta"),
             preflight_ok=preflight.get("ok"),
@@ -1033,16 +1120,57 @@ def in_entry_window(close_time_et):
 def process_completed_five_minute_bar(symbol, bar):
     refresh_contract_previews_if_needed(reason="five_minute_bar")
 
-    if not in_entry_window(bar["close_time"]):
+    close_clock = bar["close_time"].time()
+    if close_clock > ENTRY_WINDOW_END:
+        pending_sweep_confirmations.pop(symbol, None)
+        return
+    if close_clock < ENTRY_WINDOW_START:
         return
 
     setup = current_setup(symbol)
     if not setup or was_symbol_traded_today(symbol):
+        pending_sweep_confirmations.pop(symbol, None)
         return
+
+    pending = pending_sweep_confirmations.pop(symbol, None)
+    if pending:
+        ready, reason = confirmation_entry_ready(setup, pending["swept_level"], pending["signal_bar"], bar)
+        if ready:
+            execute_entry(symbol, setup, pending["swept_level"], bar, sweep_bar=pending["signal_bar"])
+            return
+        LOGGER.info("%s sweep confirmation failed: %s", symbol, reason)
+        record_trade_event(
+            "entry_skipped",
+            symbol=symbol,
+            event_id=f"entry-confirmation-failed:{symbol}:{pending['signal_bar']['close_time'].isoformat()}",
+            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+            reason=f"sweep confirmation failed: {reason}",
+            swept_level=pending["swept_level"].name,
+            swept_level_price=pending["swept_level"].price,
+            sweep_signal_close_time=pending["signal_bar"].get("close_time"),
+        )
 
     swept_level = swept_level_for_bar(setup, bar)
     if swept_level:
-        execute_entry(symbol, setup, swept_level, bar)
+        pending_sweep_confirmations[symbol] = {"swept_level": swept_level, "signal_bar": bar.copy()}
+        LOGGER.info(
+            "%s %s swept %s %.2f at %s; waiting for next 5m confirmation",
+            symbol,
+            setup.bias.direction,
+            swept_level.name,
+            swept_level.price,
+            bar["close_time"],
+        )
+        record_trade_event(
+            "entry_signal",
+            symbol=symbol,
+            event_id=f"entry-signal:{symbol}:{bar['close_time'].isoformat()}",
+            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+            swept_level=swept_level.name,
+            swept_level_price=swept_level.price,
+            sweep_signal_close_time=bar.get("close_time"),
+            reason="meaningful sweep/reclaim detected; waiting for next 5m confirmation",
+        )
 
 
 def breakeven_trigger_hit(option_type, minute_bar, trigger_underlying):

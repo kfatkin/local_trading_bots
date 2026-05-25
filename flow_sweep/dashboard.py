@@ -654,8 +654,8 @@ DASHBOARD_HTML = """<!doctype html>
         function keyLevelAction(level) {
             if (level.status === 'pending') return 'Pending premarket';
             if (level.status === 'missing') return 'Missing';
-            if (level.role === 'observed' && level.side === 'support') return 'Observed: calls on close back above';
-            if (level.role === 'observed' && level.side === 'resistance') return 'Observed: puts on close back below';
+            if (level.role === 'observed' && level.side === 'support') return 'Observed: calls after confirmed reclaim';
+            if (level.role === 'observed' && level.side === 'resistance') return 'Observed: puts after confirmed rejection';
             return 'Skipped for this setup';
         }
         function keyLevels(decision) {

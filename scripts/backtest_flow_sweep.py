@@ -14,6 +14,9 @@ if str(PROJECT_DIR) not in sys.path:
 
 from flow_sweep.config import (  # noqa: E402
     BREAKEVEN_TRIGGER_R_MULTIPLE,
+    ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
+    ENTRY_MAX_TARGET_R_MULTIPLE,
+    ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT,
     ENTRY_WINDOW_END,
     ENTRY_WINDOW_START,
     ET,
@@ -29,6 +32,8 @@ from flow_sweep.flow_data import query_flow_scores, summarize_flow_rows  # noqa:
 from flow_sweep.market_data import daily_bars, get_schedule, intraday_bars, previous_calendar_week_sessions  # noqa: E402
 from flow_sweep.strategy import (  # noqa: E402
     apply_level_roles,
+    confirmation_entry_ready,
+    entry_risk_quality_reason,
     setup_from_key_levels,
     swept_level_for_bar,
     target_level_for_entry,
@@ -323,64 +328,119 @@ def backtest_symbol(symbol, schedule, session_indices):
             continue
 
         entry_found = False
+        pending_signal = None
         for bar_index, (_timestamp, row) in enumerate(bars.iterrows()):
             signal_bar = bar_dict(row)
-            if not in_entry_window(signal_bar["close_time"]):
+            close_clock = signal_bar["close_time"].time()
+            if close_clock > ENTRY_WINDOW_END:
+                pending_signal = None
+                break
+            if close_clock < ENTRY_WINDOW_START:
                 continue
+
+            if pending_signal:
+                swept = pending_signal["swept_level"]
+                sweep_bar = pending_signal["signal_bar"]
+                ready, confirmation_reason = confirmation_entry_ready(setup, swept, sweep_bar, signal_bar)
+                if ready:
+                    option_type = "CALL" if bias.direction == "bullish" else "PUT"
+                    stop = sweep_bar["low"] if option_type == "CALL" else sweep_bar["high"]
+                    target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop)
+                    if not target_level or not risk_plan:
+                        rows.append(
+                            {
+                                **base,
+                                "status": "SKIPPED",
+                                "reason": "Invalid entry/stop risk",
+                                "entry_time": signal_bar["close_time"].isoformat(),
+                                "swept_level": swept.name,
+                                "swept_level_price": swept.price,
+                            }
+                        )
+                        pending_signal = None
+                        continue
+
+                    quality_reason = entry_risk_quality_reason(risk_plan)
+                    if quality_reason:
+                        rows.append(
+                            {
+                                **base,
+                                "status": "SKIPPED",
+                                "reason": quality_reason,
+                                "entry_time": signal_bar["close_time"].isoformat(),
+                                "entry_price": round(signal_bar["close"], 4),
+                                "stop_price": round(stop, 4),
+                                "swept_level": swept.name,
+                                "swept_level_price": swept.price,
+                                "target_name": target_level.name,
+                                "target_price": round(target_level.price, 4),
+                                "target_r": risk_plan["target_r_multiple"],
+                            }
+                        )
+                        pending_signal = None
+                        continue
+
+                    exit_result = simulate_exit(
+                        option_type,
+                        bar_index,
+                        bars,
+                        signal_bar["close"],
+                        stop,
+                        target_level.price,
+                        risk_plan["breakeven_trigger_underlying"],
+                    )
+                    if not exit_result:
+                        rows.append({**base, "status": "SKIPPED", "reason": "Invalid simulated risk"})
+                        pending_signal = None
+                        continue
+
+                    rows.append(
+                        {
+                            **base,
+                            "status": "TRADE",
+                            "option_type": option_type,
+                            "swept_level": swept.name,
+                            "swept_level_price": swept.price,
+                            "sweep_signal_time": sweep_bar["close_time"].isoformat(),
+                            "entry_time": signal_bar["close_time"].isoformat(),
+                            "entry_price": round(signal_bar["close"], 4),
+                            "stop_price": round(stop, 4),
+                            "target_name": target_level.name,
+                            "target_price": round(target_level.price, 4),
+                            "risk": risk_plan["risk_underlying"],
+                            "target_r": risk_plan["target_r_multiple"],
+                            "breakeven_trigger": risk_plan["breakeven_trigger_underlying"],
+                            "exit_time": exit_result["exit_time"].isoformat() if exit_result["exit_time"] else None,
+                            "exit_price": round(exit_result["exit_price"], 4),
+                            "exit_reason": exit_result["exit_reason"],
+                            "r_multiple": round(exit_result["r_multiple"], 4),
+                            "breakeven_active": exit_result["breakeven_active"],
+                        }
+                    )
+                    entry_found = True
+                    break
+
+                rows.append(
+                    {
+                        **base,
+                        "status": "SKIPPED",
+                        "reason": f"Confirmation failed: {confirmation_reason}",
+                        "sweep_signal_time": sweep_bar["close_time"].isoformat(),
+                        "entry_time": signal_bar["close_time"].isoformat(),
+                        "swept_level": swept.name,
+                        "swept_level_price": swept.price,
+                    }
+                )
+                pending_signal = None
 
             swept = swept_level_for_bar(setup, signal_bar)
             if not swept:
                 continue
 
-            option_type = "CALL" if bias.direction == "bullish" else "PUT"
-            stop = signal_bar["low"] if option_type == "CALL" else signal_bar["high"]
-            target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop)
-            if not target_level or not risk_plan:
-                rows.append({**base, "status": "SKIPPED", "reason": "Invalid entry/stop risk", "entry_time": signal_bar["close_time"].isoformat()})
-                entry_found = True
-                break
-
-            exit_result = simulate_exit(
-                option_type,
-                bar_index,
-                bars,
-                signal_bar["close"],
-                stop,
-                target_level.price,
-                risk_plan["breakeven_trigger_underlying"],
-            )
-            if not exit_result:
-                rows.append({**base, "status": "SKIPPED", "reason": "Invalid simulated risk"})
-                entry_found = True
-                break
-
-            rows.append(
-                {
-                    **base,
-                    "status": "TRADE",
-                    "option_type": option_type,
-                    "swept_level": swept.name,
-                    "swept_level_price": swept.price,
-                    "entry_time": signal_bar["close_time"].isoformat(),
-                    "entry_price": round(signal_bar["close"], 4),
-                    "stop_price": round(stop, 4),
-                    "target_name": target_level.name,
-                    "target_price": round(target_level.price, 4),
-                    "risk": risk_plan["risk_underlying"],
-                    "target_r": risk_plan["target_r_multiple"],
-                    "breakeven_trigger": risk_plan["breakeven_trigger_underlying"],
-                    "exit_time": exit_result["exit_time"].isoformat() if exit_result["exit_time"] else None,
-                    "exit_price": round(exit_result["exit_price"], 4),
-                    "exit_reason": exit_result["exit_reason"],
-                    "r_multiple": round(exit_result["r_multiple"], 4),
-                    "breakeven_active": exit_result["breakeven_active"],
-                }
-            )
-            entry_found = True
-            break
+            pending_signal = {"swept_level": swept, "signal_bar": signal_bar, "bar_index": bar_index}
 
         if not entry_found:
-            rows.append({**base, "status": "NO_ENTRY", "reason": "No 5m sweep/reclaim in entry window"})
+            rows.append({**base, "status": "NO_ENTRY", "reason": "No confirmed 5m sweep/reclaim in entry window"})
 
     return rows
 
@@ -454,6 +514,10 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         "## Assumptions",
         "",
         "- Uses UW scored-flow rows from each prior regular session and underlying OHLC price data for the tested session.",
+        f"- Entries are only considered from {ENTRY_WINDOW_START.strftime('%H:%M')} through {ENTRY_WINDOW_END.strftime('%H:%M')} ET.",
+        "- Entry requires a meaningful sweep/reclaim candle followed by one confirming 5-minute candle.",
+        f"- Sweep and confirmation strength uses a {fmt_pct(ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT)} candle-range close test, and sweep candles must clear the level by at least {fmt_pct(ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT)} of candle range.",
+        f"- Planned targets above {ENTRY_MAX_TARGET_R_MULTIPLE:.2f}R are skipped as low-quality/tight-risk entries.",
         "- Results are measured in underlying R multiples, not historical option premium PnL.",
         "- Breakeven stop is approximated as an underlying entry-price stop after the 1.5R trigger because historical option bid/ask marks are not replayed here.",
         "- Intrabar conflicts follow the live bot priority: target first, then initial stop, then breakeven activation/stop, then EOD.",
