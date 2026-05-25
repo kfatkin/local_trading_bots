@@ -14,12 +14,14 @@ from .config import (
     DASHBOARD_ENABLED,
     DASHBOARD_HOST,
     DASHBOARD_PORT,
+    ENABLE_CONTINUATION_FVG,
     ENTRY_WINDOW_END,
     ENTRY_WINDOW_START,
     ET,
     LOGGER,
     MIN_FLOW_SCORE,
     OPTION_PREVIEW_REFRESH_SECONDS,
+    PARTIAL_EXIT_PCT,
     PAPER,
     RUNTIME_DIR,
     SYMBOLS,
@@ -199,6 +201,13 @@ def position_payload(symbol, position, broker_position=None):
         "breakeven_trigger_r_multiple": round_or_none(position.get("breakeven_trigger_r_multiple"), 2),
         "breakeven_stop_option_price": round_or_none(position.get("breakeven_stop_option_price"), 4),
         "breakeven_activated_at": position.get("breakeven_activated_at"),
+        "partial_exit_pct": round_or_none(position.get("partial_exit_pct"), 2),
+        "partial_exit_taken": bool(position.get("partial_exit_taken")),
+        "partial_exit_qty_requested": to_int_qty(position.get("partial_exit_qty_requested", 0)),
+        "partial_exit_trigger_r_multiple": round_or_none(position.get("partial_exit_trigger_r_multiple"), 2),
+        "partial_exit_trigger_underlying": round_or_none(position.get("partial_exit_trigger_underlying")),
+        "partial_exit_requested_at": position.get("partial_exit_requested_at"),
+        "partial_exit_skipped_reason": position.get("partial_exit_skipped_reason"),
         "entry_option_delta": round_or_none(position.get("entry_option_delta"), 4),
         "entry_option_gamma": round_or_none(position.get("entry_option_gamma"), 4),
         "entry_option_theta": round_or_none(position.get("entry_option_theta"), 4),
@@ -354,6 +363,8 @@ def dashboard_status_payload():
             "consensus_threshold": CONSENSUS_THRESHOLD,
             "trade_allocation_pct": TRADE_ALLOCATION_PCT,
             "target_delta": TARGET_DELTA,
+            "partial_exit_pct": PARTIAL_EXIT_PCT,
+            "continuation_fvg_enabled": ENABLE_CONTINUATION_FVG,
             "option_preview_refresh_seconds": OPTION_PREVIEW_REFRESH_SECONDS,
             "entry_window": f"{ENTRY_WINDOW_START.strftime('%H:%M')}-{ENTRY_WINDOW_END.strftime('%H:%M')} ET",
             "dashboard_url": f"http://{display_host}:{DASHBOARD_PORT}",
@@ -594,7 +605,9 @@ DASHBOARD_HTML = """<!doctype html>
             const active = position.breakeven_active;
             const stopLine = active ? `BE option ${premium(position.breakeven_stop_option_price)}` : `Underlying ${px(position.stop_underlying)}`;
             const trigger = position.breakeven_trigger_underlying == null ? '-' : `${px(position.breakeven_trigger_underlying)} (${fixed(position.breakeven_trigger_r_multiple || 1.5, 1)}R)`;
-            return `<div class="plan-line"><strong>${esc(stopLine)}</strong></div><div class="muted">Initial ${px(position.initial_stop_underlying || position.stop_underlying)} / BE trigger ${trigger}</div>`;
+            const partial = position.partial_exit_pct == null ? '-' : `${pct(position.partial_exit_pct)} at ${fixed(position.partial_exit_trigger_r_multiple || 1.5, 1)}R`;
+            const partialState = position.partial_exit_taken ? (position.partial_exit_skipped_reason ? `skipped: ${position.partial_exit_skipped_reason}` : `requested ${position.partial_exit_qty_requested || '-'}`) : 'pending';
+            return `<div class="plan-line"><strong>${esc(stopLine)}</strong></div><div class="muted">Initial ${px(position.initial_stop_underlying || position.stop_underlying)} / BE trigger ${trigger}</div><div class="muted">Partial ${partial} / ${esc(partialState)}</div>`;
         }
         function targetPlan(position) {
             const target = position.target_underlying == null ? '-' : `${px(position.target_underlying)}${position.target_name ? ` (${esc(position.target_name)})` : ''}`;
@@ -845,6 +858,8 @@ DASHBOARD_HTML = """<!doctype html>
                 metric('Broker Orders', data.broker_open_orders.length),
                 metric('Account Balance', usd(data.daily_context.account && data.daily_context.account.account_balance)),
                 metric('Allocation', `${(data.bot.trade_allocation_pct * 100).toFixed(1)}% balance`),
+                metric('Partial Exit', `${pct(data.bot.partial_exit_pct)} at BE`),
+                metric('Continuation FVG', data.bot.continuation_fvg_enabled ? 'On' : 'Off'),
                 metric('Trade Events', (data.daily_trade_state.events || []).length)
             ].join('');
             table('alpaca', ['Area', 'Status', 'Details'], alpacaStatusRows(data), 'Alpaca account and clock details unavailable.');

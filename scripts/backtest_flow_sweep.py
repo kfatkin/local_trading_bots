@@ -14,6 +14,8 @@ if str(PROJECT_DIR) not in sys.path:
 
 from flow_sweep.config import (  # noqa: E402
     BREAKEVEN_TRIGGER_R_MULTIPLE,
+    CONSENSUS_THRESHOLD,
+    ENABLE_CONTINUATION_FVG,
     ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
     ENTRY_MAX_TARGET_R_MULTIPLE,
     ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT,
@@ -21,6 +23,7 @@ from flow_sweep.config import (  # noqa: E402
     ENTRY_WINDOW_START,
     ET,
     PREMARKET_START,
+    PARTIAL_EXIT_PCT,
     REGULAR_OPEN,
     RUNTIME_DIR,
     SYMBOLS,
@@ -206,7 +209,7 @@ def bar_dict(row):
 
 
 def in_entry_window(close_time):
-    return ENTRY_WINDOW_START <= close_time.time() <= ENTRY_WINDOW_END
+    return ENTRY_WINDOW_START <= close_time.time() < ENTRY_WINDOW_END
 
 
 def exit_r(option_type, entry, exit_price, risk):
@@ -215,15 +218,31 @@ def exit_r(option_type, entry, exit_price, risk):
     return (entry - exit_price) / risk
 
 
+def partial_adjusted_r(partial_exit_taken, remaining_r):
+    if not partial_exit_taken or PARTIAL_EXIT_PCT <= 0:
+        return remaining_r
+    partial_fraction = min(max(PARTIAL_EXIT_PCT, 0.0), 1.0)
+    return partial_fraction * BREAKEVEN_TRIGGER_R_MULTIPLE + (1 - partial_fraction) * remaining_r
+
+
 def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, breakeven_trigger):
     risk = entry - stop if option_type == "CALL" else stop - entry
     if risk <= 0:
         return None
 
     breakeven_active = False
+    partial_exit_taken = False
     rows = list(bars.iloc[entry_bar_index + 1 :].iterrows())
     if not rows:
-        return {"exit_reason": "NO_FUTURE_BARS", "exit_price": entry, "exit_time": None, "r_multiple": 0.0, "breakeven_active": False}
+        return {
+            "exit_reason": "NO_FUTURE_BARS",
+            "exit_price": entry,
+            "exit_time": None,
+            "r_multiple": 0.0,
+            "breakeven_active": False,
+            "partial_exit_taken": False,
+            "partial_exit_r": None,
+        }
 
     last_bar = None
     for _timestamp, row in rows:
@@ -241,12 +260,15 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
             be_stop_hit = current["high"] >= entry
 
         if target_hit:
+            target_r = exit_r(option_type, entry, target, risk)
             return {
                 "exit_reason": "TARGET",
                 "exit_price": target,
                 "exit_time": current["close_time"],
-                "r_multiple": exit_r(option_type, entry, target, risk),
+                "r_multiple": partial_adjusted_r(partial_exit_taken, target_r),
                 "breakeven_active": breakeven_active,
+                "partial_exit_taken": partial_exit_taken,
+                "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
         if not breakeven_active and stop_hit:
@@ -256,6 +278,8 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "exit_time": current["close_time"],
                 "r_multiple": -1.0,
                 "breakeven_active": False,
+                "partial_exit_taken": False,
+                "partial_exit_r": None,
             }
 
         if breakeven_active and be_stop_hit:
@@ -263,28 +287,36 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "exit_reason": "BREAKEVEN",
                 "exit_price": entry,
                 "exit_time": current["close_time"],
-                "r_multiple": 0.0,
+                "r_multiple": partial_adjusted_r(partial_exit_taken, 0.0),
                 "breakeven_active": True,
+                "partial_exit_taken": partial_exit_taken,
+                "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
         if not breakeven_active and be_trigger_hit:
             breakeven_active = True
+            partial_exit_taken = PARTIAL_EXIT_PCT > 0
 
         if current["close_time"].time() >= dt_time(15, 55):
+            eod_r = exit_r(option_type, entry, current["close"], risk)
             return {
                 "exit_reason": "EOD",
                 "exit_price": current["close"],
                 "exit_time": current["close_time"],
-                "r_multiple": exit_r(option_type, entry, current["close"], risk),
+                "r_multiple": partial_adjusted_r(partial_exit_taken, eod_r),
                 "breakeven_active": breakeven_active,
+                "partial_exit_taken": partial_exit_taken,
+                "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
     return {
         "exit_reason": "LAST_BAR",
         "exit_price": last_bar["close"],
         "exit_time": last_bar["close_time"],
-        "r_multiple": exit_r(option_type, entry, last_bar["close"], risk),
+        "r_multiple": partial_adjusted_r(partial_exit_taken, exit_r(option_type, entry, last_bar["close"], risk)),
         "breakeven_active": breakeven_active,
+        "partial_exit_taken": partial_exit_taken,
+        "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
     }
 
 
@@ -337,11 +369,11 @@ def backtest_symbol(symbol, schedule, session_indices):
 
         entry_found = False
         pending_signal = None
-        continuation_context = new_continuation_context()
+        continuation_context = new_continuation_context() if ENABLE_CONTINUATION_FVG else None
         for bar_index, (_timestamp, row) in enumerate(bars.iterrows()):
             signal_bar = bar_dict(row)
             close_clock = signal_bar["close_time"].time()
-            if close_clock > ENTRY_WINDOW_END:
+            if close_clock >= ENTRY_WINDOW_END:
                 pending_signal = None
                 break
             if close_clock < ENTRY_WINDOW_START:
@@ -374,8 +406,8 @@ def backtest_symbol(symbol, schedule, session_indices):
                     )
                 pending_signal = None
 
-            active_zone = continuation_context.get("active_zone")
-            if active_zone:
+            active_zone = continuation_context.get("active_zone") if continuation_context else None
+            if ENABLE_CONTINUATION_FVG and active_zone:
                 zone_status, zone_reason = continuation_zone_status(setup, active_zone, signal_bar)
                 if zone_status == "ready":
                     candidates.append({"armed_at": active_zone["armed_at"], "metadata": continuation_entry_metadata(active_zone, signal_bar)})
@@ -478,6 +510,9 @@ def backtest_symbol(symbol, schedule, session_indices):
                             "exit_reason": exit_result["exit_reason"],
                             "r_multiple": round(exit_result["r_multiple"], 4),
                             "breakeven_active": exit_result["breakeven_active"],
+                            "partial_exit_taken": exit_result.get("partial_exit_taken"),
+                            "partial_exit_pct": PARTIAL_EXIT_PCT if exit_result.get("partial_exit_taken") else None,
+                            "partial_exit_r": exit_result.get("partial_exit_r"),
                             **(metadata.get("event_fields") or {}),
                         }
                     )
@@ -487,8 +522,8 @@ def backtest_symbol(symbol, schedule, session_indices):
                 if entry_found:
                     break
 
-            expired_zone = age_active_continuation_zone(continuation_context)
-            if expired_zone:
+            expired_zone = age_active_continuation_zone(continuation_context) if continuation_context else None
+            if ENABLE_CONTINUATION_FVG and expired_zone:
                 rows.append(
                     {
                         **base,
@@ -504,13 +539,14 @@ def backtest_symbol(symbol, schedule, session_indices):
                     }
                 )
 
-            continuation_context["recent_bars"].append(signal_bar.copy())
-            trim_tail(continuation_context["recent_bars"])
-            update_continuation_swings(continuation_context)
+            if ENABLE_CONTINUATION_FVG and continuation_context:
+                continuation_context["recent_bars"].append(signal_bar.copy())
+                trim_tail(continuation_context["recent_bars"])
+                update_continuation_swings(continuation_context)
 
-            new_zone = build_continuation_zone(setup, continuation_context, signal_bar)
-            if new_zone and (not continuation_context.get("active_zone") or new_zone["armed_at"] >= continuation_context["active_zone"]["armed_at"]):
-                continuation_context["active_zone"] = new_zone
+                new_zone = build_continuation_zone(setup, continuation_context, signal_bar)
+                if new_zone and (not continuation_context.get("active_zone") or new_zone["armed_at"] >= continuation_context["active_zone"]["armed_at"]):
+                    continuation_context["active_zone"] = new_zone
 
             swept = swept_level_for_bar(setup, signal_bar)
             if not swept:
@@ -519,7 +555,10 @@ def backtest_symbol(symbol, schedule, session_indices):
             pending_signal = {"swept_level": swept, "signal_bar": signal_bar, "bar_index": bar_index}
 
         if not entry_found:
-            rows.append({**base, "status": "NO_ENTRY", "reason": "No confirmed sweep or continuation FVG entry in entry window"})
+            no_entry_reason = "No confirmed sweep entry in entry window"
+            if ENABLE_CONTINUATION_FVG:
+                no_entry_reason = "No confirmed sweep or continuation FVG entry in entry window"
+            rows.append({**base, "status": "NO_ENTRY", "reason": no_entry_reason})
 
     return rows
 
@@ -584,6 +623,10 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
     exit_counts = pd.Series([row.get("exit_reason") for row in rows if row.get("status") == "TRADE"]).value_counts().to_dict()
     setup_counts = pd.Series([row.get("setup_type", "unknown") for row in rows if row.get("status") == "TRADE"]).value_counts().to_dict()
 
+    entry_model_line = "- Entry uses the confirmed level-sweep model."
+    if ENABLE_CONTINUATION_FVG:
+        entry_model_line = "- Entry can come from either the confirmed level-sweep model or the continuation FVG model, with the earliest armed valid setup winning for that symbol."
+
     lines = [
         "# Flow Sweep Backtest",
         "",
@@ -594,14 +637,15 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         "## Assumptions",
         "",
         "- Uses UW scored-flow rows from each prior regular session and underlying OHLC price data for the tested session.",
-        f"- Entries are only considered from {ENTRY_WINDOW_START.strftime('%H:%M')} through {ENTRY_WINDOW_END.strftime('%H:%M')} ET.",
-        "- Entry can come from either the confirmed level-sweep model or the continuation FVG model, with the earliest armed valid setup winning for that symbol.",
+        f"- Entries are only considered from {ENTRY_WINDOW_START.strftime('%H:%M')} until before {ENTRY_WINDOW_END.strftime('%H:%M')} ET.",
+        f"- Prior-session flow must have at least {fmt_pct(CONSENSUS_THRESHOLD)} premium consensus in one direction.",
+        entry_model_line,
         "- Sweep entries require a meaningful sweep/reclaim candle followed by one confirming 5-minute candle.",
-        "- Continuation entries require a 5-minute break of structure with displacement, an armed fair value gap, and then a touch plus directional confirming close back out of the gap.",
+        "- Continuation FVG entries are disabled by default and only included when FLOW_SWEEP_ENABLE_CONTINUATION_FVG=true.",
         f"- Sweep and confirmation strength uses a {fmt_pct(ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT)} candle-range close test, and sweep candles must clear the level by at least {fmt_pct(ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT)} of candle range.",
         f"- Planned targets above {ENTRY_MAX_TARGET_R_MULTIPLE:.2f}R are skipped as low-quality/tight-risk entries.",
         "- Results are measured in underlying R multiples, not historical option premium PnL.",
-        "- Breakeven stop is approximated as an underlying entry-price stop after the 1.5R trigger because historical option bid/ask marks are not replayed here.",
+        f"- A {fmt_pct(PARTIAL_EXIT_PCT)} partial is credited at the {BREAKEVEN_TRIGGER_R_MULTIPLE:.2f}R trigger; the remainder is managed with a breakeven stop approximation because historical option bid/ask marks are not replayed here.",
         "- Intrabar conflicts follow the live bot priority: target first, then initial stop, then breakeven activation/stop, then EOD.",
         "",
         "## Summary",

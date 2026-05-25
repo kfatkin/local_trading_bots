@@ -15,6 +15,7 @@ from .config import (
     CONTINUATION_DISPLACEMENT_LOOKBACK,
     CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE,
     CONTINUATION_MAX_ZONE_AGE_BARS,
+    ENABLE_CONTINUATION_FVG,
     ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
     ENTRY_MAX_TARGET_R_MULTIPLE,
     ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT,
@@ -26,6 +27,7 @@ from .config import (
     LOGGER,
     MIN_FLOW_SCORE,
     OPTION_PREVIEW_REFRESH_SECONDS,
+    PARTIAL_EXIT_PCT,
     PAPER,
     REGULAR_OPEN,
     SYMBOLS,
@@ -238,12 +240,16 @@ def setup_plan_summary(setup):
     if setup.bias.direction == "bullish":
         trigger_levels = setup.support_levels
         target_levels = sorted(setup.resistance_levels, key=lambda level: level.price)
-        action = "Buy calls after either a confirmed sweep/reclaim or a bullish 5m continuation FVG pullback"
+        action = "Buy calls after a confirmed sweep/reclaim"
+        if ENABLE_CONTINUATION_FVG:
+            action = "Buy calls after either a confirmed sweep/reclaim or a bullish 5m continuation FVG pullback"
         option_type = "CALL"
     else:
         trigger_levels = setup.resistance_levels
         target_levels = sorted(setup.support_levels, key=lambda level: level.price, reverse=True)
-        action = "Buy puts after either a confirmed sweep/rejection or a bearish 5m continuation FVG pullback"
+        action = "Buy puts after a confirmed sweep/rejection"
+        if ENABLE_CONTINUATION_FVG:
+            action = "Buy puts after either a confirmed sweep/rejection or a bearish 5m continuation FVG pullback"
         option_type = "PUT"
 
     return {
@@ -939,6 +945,10 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
             "breakeven_active": False,
             "breakeven_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
             "breakeven_stop_option_price": contract.get("ask"),
+            "partial_exit_pct": PARTIAL_EXIT_PCT,
+            "partial_exit_taken": False,
+            "partial_exit_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
+            "partial_exit_trigger_underlying": risk_plan["breakeven_trigger_underlying"],
             "swept_level": signal_name,
             "swept_level_price": signal_price,
             "signal_name": signal_name,
@@ -1343,14 +1353,14 @@ def update_five_minute_bar(symbol, minute_bar):
 
 def in_entry_window(close_time_et):
     close_clock = close_time_et.time()
-    return ENTRY_WINDOW_START <= close_clock <= ENTRY_WINDOW_END
+    return ENTRY_WINDOW_START <= close_clock < ENTRY_WINDOW_END
 
 
 def process_completed_five_minute_bar(symbol, bar):
     refresh_contract_previews_if_needed(reason="five_minute_bar")
 
     close_clock = bar["close_time"].time()
-    if close_clock > ENTRY_WINDOW_END:
+    if close_clock >= ENTRY_WINDOW_END:
         pending_sweep_confirmations.pop(symbol, None)
         continuation_contexts.pop(symbol, None)
         return
@@ -1363,7 +1373,11 @@ def process_completed_five_minute_bar(symbol, bar):
         continuation_contexts.pop(symbol, None)
         return
 
-    context = continuation_contexts.setdefault(symbol, new_continuation_context())
+    if ENABLE_CONTINUATION_FVG:
+        context = continuation_contexts.setdefault(symbol, new_continuation_context())
+    else:
+        continuation_contexts.pop(symbol, None)
+        context = None
     candidates = []
 
     pending = pending_sweep_confirmations.pop(symbol, None)
@@ -1390,8 +1404,8 @@ def process_completed_five_minute_bar(symbol, bar):
                 sweep_signal_close_time=pending["signal_bar"].get("close_time"),
             )
 
-    active_zone = context.get("active_zone")
-    if active_zone:
+    active_zone = context.get("active_zone") if context else None
+    if ENABLE_CONTINUATION_FVG and active_zone:
         status, reason = continuation_zone_status(setup, active_zone, bar)
         if status == "ready":
             candidates.append({"armed_at": active_zone.get("armed_at"), "metadata": continuation_entry_metadata(active_zone, bar)})
@@ -1426,8 +1440,8 @@ def process_completed_five_minute_bar(symbol, bar):
                 continuation_contexts.pop(symbol, None)
                 return
 
-    expired_zone = age_active_continuation_zone(context)
-    if expired_zone:
+    expired_zone = age_active_continuation_zone(context) if context else None
+    if ENABLE_CONTINUATION_FVG and expired_zone:
         LOGGER.info("%s continuation FVG expired without entry after %s bars", symbol, expired_zone["age_bars"])
         record_trade_event(
             "entry_skipped",
@@ -1444,37 +1458,38 @@ def process_completed_five_minute_bar(symbol, bar):
             continuation_signal_close_time=expired_zone.get("armed_at"),
         )
 
-    context["recent_bars"].append(bar.copy())
-    trim_tail(context["recent_bars"])
-    update_continuation_swings(context)
+    if ENABLE_CONTINUATION_FVG and context:
+        context["recent_bars"].append(bar.copy())
+        trim_tail(context["recent_bars"])
+        update_continuation_swings(context)
 
-    new_zone = build_continuation_zone(setup, context, bar)
-    if new_zone and (not context.get("active_zone") or new_zone["armed_at"] >= context["active_zone"]["armed_at"]):
-        context["active_zone"] = new_zone
-        LOGGER.info(
-            "%s %s continuation FVG armed %.2f-%.2f with structure %.2f at %s",
-            symbol,
-            setup.bias.direction,
-            new_zone["zone_low"],
-            new_zone["zone_high"],
-            new_zone["structure_price"],
-            new_zone["armed_at"],
-        )
-        record_trade_event(
-            "entry_signal",
-            symbol=symbol,
-            event_id=f"entry-continuation-signal:{symbol}:{new_zone['armed_at'].isoformat()}",
-            setup_type="continuation_fvg",
-            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-            swept_level=new_zone["signal_name"],
-            swept_level_price=round((new_zone["zone_low"] + new_zone["zone_high"]) / 2, 4),
-            continuation_zone_low=new_zone["zone_low"],
-            continuation_zone_high=new_zone["zone_high"],
-            continuation_break_level=new_zone["break_level_price"],
-            continuation_structure_price=new_zone["structure_price"],
-            continuation_signal_close_time=new_zone.get("armed_at"),
-            reason="bullish continuation FVG armed" if setup.bias.direction == "bullish" else "bearish continuation FVG armed",
-        )
+        new_zone = build_continuation_zone(setup, context, bar)
+        if new_zone and (not context.get("active_zone") or new_zone["armed_at"] >= context["active_zone"]["armed_at"]):
+            context["active_zone"] = new_zone
+            LOGGER.info(
+                "%s %s continuation FVG armed %.2f-%.2f with structure %.2f at %s",
+                symbol,
+                setup.bias.direction,
+                new_zone["zone_low"],
+                new_zone["zone_high"],
+                new_zone["structure_price"],
+                new_zone["armed_at"],
+            )
+            record_trade_event(
+                "entry_signal",
+                symbol=symbol,
+                event_id=f"entry-continuation-signal:{symbol}:{new_zone['armed_at'].isoformat()}",
+                setup_type="continuation_fvg",
+                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
+                swept_level=new_zone["signal_name"],
+                swept_level_price=round((new_zone["zone_low"] + new_zone["zone_high"]) / 2, 4),
+                continuation_zone_low=new_zone["zone_low"],
+                continuation_zone_high=new_zone["zone_high"],
+                continuation_break_level=new_zone["break_level_price"],
+                continuation_structure_price=new_zone["structure_price"],
+                continuation_signal_close_time=new_zone.get("armed_at"),
+                reason="bullish continuation FVG armed" if setup.bias.direction == "bullish" else "bearish continuation FVG armed",
+            )
 
     swept_level = swept_level_for_bar(setup, bar)
     if swept_level:
@@ -1529,6 +1544,69 @@ def activate_breakeven_stop(symbol):
     LOGGER.info("%s breakeven stop activated at option price %.2f", symbol, float(position.get("breakeven_stop_option_price") or 0.0))
 
 
+def planned_partial_exit_qty(total_qty):
+    total_qty = to_int_qty(total_qty)
+    if total_qty <= 1 or PARTIAL_EXIT_PCT <= 0:
+        return 0
+    requested_qty = int(total_qty * PARTIAL_EXIT_PCT)
+    if requested_qty <= 0:
+        requested_qty = 1
+    return min(requested_qty, total_qty - 1)
+
+
+def mark_partial_exit_unavailable(symbol, reason):
+    requested_at = datetime.now(UTC).isoformat()
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if not position:
+            return
+        position["partial_exit_taken"] = True
+        position["partial_exit_skipped_reason"] = reason
+        position["partial_exit_requested_at"] = requested_at
+        record_trade_event_locked(
+            "partial_exit_skipped",
+            symbol=symbol,
+            event_id=f"partial-exit-skipped:{symbol}:{requested_at}",
+            option_symbol=position.get("option_symbol"),
+            qty=position.get("total_qty"),
+            reason=reason,
+            partial_exit_pct=PARTIAL_EXIT_PCT,
+            partial_exit_trigger_r_multiple=BREAKEVEN_TRIGGER_R_MULTIPLE,
+        )
+        persist_state_locked()
+
+
+def request_partial_exit(symbol, total_qty):
+    exit_qty = planned_partial_exit_qty(total_qty)
+    if exit_qty <= 0:
+        mark_partial_exit_unavailable(symbol, "quantity below minimum runner size")
+        return False
+
+    if not execute_exit(symbol, exit_qty, f"PARTIAL_{BREAKEVEN_TRIGGER_R_MULTIPLE:.2f}R"):
+        return False
+
+    requested_at = datetime.now(UTC).isoformat()
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if position:
+            position["partial_exit_taken"] = True
+            position["partial_exit_requested_at"] = requested_at
+            position["partial_exit_qty_requested"] = exit_qty
+            record_trade_event_locked(
+                "partial_exit_requested",
+                symbol=symbol,
+                event_id=f"partial-exit-requested:{symbol}:{requested_at}",
+                option_symbol=position.get("option_symbol"),
+                qty=exit_qty,
+                remaining_qty=max(to_int_qty(position.get("total_qty", 0)) - exit_qty, 0),
+                partial_exit_pct=PARTIAL_EXIT_PCT,
+                partial_exit_trigger_r_multiple=BREAKEVEN_TRIGGER_R_MULTIPLE,
+                partial_exit_trigger_underlying=position.get("partial_exit_trigger_underlying"),
+            )
+            persist_state_locked()
+    return True
+
+
 def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
     if breakeven_price in (None, ""):
         return False
@@ -1571,6 +1649,7 @@ def manage_open_position_with_bar(symbol, minute_bar):
         breakeven_active = bool(position.get("breakeven_active"))
         breakeven_trigger_underlying = position.get("breakeven_trigger_underlying")
         breakeven_stop_option_price = position.get("breakeven_stop_option_price")
+        partial_exit_taken = bool(position.get("partial_exit_taken"))
 
     if option_type == "CALL":
         stop_hit = minute_bar["low"] <= stop_underlying
@@ -1590,6 +1669,8 @@ def manage_open_position_with_bar(symbol, minute_bar):
     if not breakeven_active and breakeven_trigger_hit(option_type, minute_bar, breakeven_trigger_underlying):
         activate_breakeven_stop(symbol)
         breakeven_active = True
+        if not partial_exit_taken:
+            request_partial_exit(symbol, total_qty)
 
     if breakeven_active and option_breakeven_stop_hit(symbol, option_symbol, breakeven_stop_option_price):
         execute_exit(symbol, total_qty, "STOP_OPTION_BREAKEVEN")

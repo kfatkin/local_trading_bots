@@ -20,11 +20,13 @@ The bot watches:
 
 Before the trading session, it queries the `uw-data` DynamoDB table with AWS profile `trading_bot` and looks for `_flow_scores_trading_bot` rows from the prior NYSE regular session where `composite_score > 70`.
 
-For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 60% of the total directional premium.
+For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 70% of the total directional premium.
 
-For bullish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 15:00 ET, it can either buy calls after a confirmed sweep/reclaim of a watched low or after a bullish 5-minute continuation fair value gap setup forms and then confirms on the pullback.
+For bullish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and noon ET, it buys calls after a confirmed sweep/reclaim of a watched low.
 
-For bearish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 15:00 ET, it can either buy puts after a confirmed sweep/rejection of a watched high or after a bearish 5-minute continuation fair value gap setup forms and then confirms on the pullback.
+For bearish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and noon ET, it buys puts after a confirmed sweep/rejection of a watched high.
+
+The continuation fair value gap model is still available for research, but it is disabled by default because the first combined sample underperformed the sweep-only baseline. Set `FLOW_SWEEP_ENABLE_CONTINUATION_FVG=true` to include it in live runs and backtests.
 
 Contracts are selected from the nearest active expiration, including 0DTE when available. The selector first scopes candidates to contracts within `0.15` absolute delta of the configured `0.30` target when available, builds a candidate band from the three contracts just below target delta and the two just above it, then ranks that band by liquidity using spread, recent option volume, and open interest. Contract previews are refreshed when the market-open setup is prepared, on the normal 5-minute review cadence, and immediately before an entry order is submitted.
 
@@ -35,7 +37,7 @@ Contracts are selected from the nearest active expiration, including 0DTE when a
 - If the 5% allocation cannot buy one contract, the bot can still buy one contract when that contract costs no more than 20% of account balance.
 - Sweep entries use the sweep candle extreme as the stop. Continuation FVG entries use the structure swing that defined the break as the stop.
 - Target is bot-managed. The bot uses the closest opposing key level only when that level offers at least 2R from the underlying entry-to-stop distance; otherwise it uses a fixed 2R underlying target so trades can still run into all-time highs or lows.
-- Once the underlying reaches 1.5R, the bot switches the stop mode to option breakeven and exits if the option market price falls back to the entry option price.
+- Once the underlying reaches 1.5R, the bot attempts to sell 50% of the position when there are enough contracts to leave a runner, then switches the remaining position to option breakeven and exits if the option market price falls back to the entry option price.
 - Remaining positions are closed near end of day at 15:55 ET.
 - Local runtime state is persisted under `runtime/state.json` so open option positions can be reconciled after restart.
 
@@ -57,14 +59,16 @@ AWS_REGION=us-east-2
 UW_TABLE_NAME=uw-data
 UW_FLOW_SCORE_PARTITION=_flow_scores_trading_bot
 FLOW_SWEEP_MIN_SCORE=70
-FLOW_SWEEP_CONSENSUS_THRESHOLD=0.60
+FLOW_SWEEP_CONSENSUS_THRESHOLD=0.70
 FLOW_SWEEP_TRADE_ALLOCATION_PCT=0.05
 FLOW_SWEEP_TARGET_DELTA=0.30
 FLOW_SWEEP_TARGET_R_MULTIPLE=2.0
 FLOW_SWEEP_BREAKEVEN_TRIGGER_R_MULTIPLE=1.5
+FLOW_SWEEP_PARTIAL_EXIT_PCT=0.50
 FLOW_SWEEP_ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT=0.50
 FLOW_SWEEP_ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT=0.10
 FLOW_SWEEP_ENTRY_MAX_TARGET_R_MULTIPLE=8.0
+FLOW_SWEEP_ENABLE_CONTINUATION_FVG=false
 FLOW_SWEEP_CONTINUATION_DISPLACEMENT_LOOKBACK=5
 FLOW_SWEEP_CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE=1.25
 FLOW_SWEEP_CONTINUATION_MAX_ZONE_AGE_BARS=6

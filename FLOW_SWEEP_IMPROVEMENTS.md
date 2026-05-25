@@ -10,6 +10,10 @@
 - Keep the stop at the original sweep candle extreme, not the confirmation candle extreme.
 - Skip entries where the planned opposing-level target is above 8R, which usually means the risk is too tight or the nearest opposing level is too far away for this scalp structure.
 - Add a continuation fair value gap strategy as an alternative, bias-aligned setup. The live bot and backtest now allow both strategies, with the first valid armed setup winning for a symbol.
+- Raise the default premium-consensus requirement from 60% to 70% so mixed prior-session flow is filtered out.
+- Restrict new entries to the higher-quality morning window from 10:00 ET until before 12:00 ET.
+- Keep the continuation FVG implementation available behind `FLOW_SWEEP_ENABLE_CONTINUATION_FVG`, but disable it by default until it has a better standalone baseline.
+- Add a 50% partial-profit request at the 1.5R breakeven trigger when the live position has enough contracts to leave a runner.
 
 ## Next Improvements To Test
 
@@ -26,6 +30,9 @@
 - The main observed failure cluster was 09:45 entries: 7 of 10 stops came from the first eligible 5-minute close.
 - The new rules intentionally reduce trade count to favor cleaner acceptance after a level sweep.
 - Expanding the confirmed-entry window from 10:00-10:30 ET to 10:00-15:00 ET improved the 40-session test to 13 trades, 5 wins, 6 losses, 2 breakeven exits, 2.31 profit factor, and +7.83R total.
+- The first combined sweep-plus-continuation run produced 14 trades, 1.73 profit factor, and +5.83R total. Continuation FVG contributed only 1 trade in that sample, and it stopped out, so the continuation defaults still need tuning.
+- The next-pass changes should be measured against the 13-trade sweep-only baseline: 38.5% win rate, 2.31 profit factor, and +7.83R total. The key hypothesis is that 70% consensus, no fresh noon-or-later entries, and 1.5R partials improve realized win rate without fully starving trade count.
+- The first next-pass 40-session run produced 7 trades, 5 wins, 2 losses, 0 breakeven exits, 71.4% win rate, 5.33 profit factor, and +8.67R total. This improved the prior sweep-only total R and profit factor, but cut trade count nearly in half.
 
 ## Continuation FVG Strategy
 
