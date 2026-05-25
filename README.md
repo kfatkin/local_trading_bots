@@ -94,9 +94,14 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
+`setup.sh` uses an isolated Docker config at `runtime/docker-config` by default. This avoids WSL/Docker Desktop credential-helper failures while pulling public base images such as `python:3.11-slim`. If you prefer your normal Docker config, run with `USE_HOST_DOCKER_CONFIG=1 ./setup.sh`.
+
 Manual Docker run:
 
 ```bash
+export DOCKER_CONFIG="${DOCKER_CONFIG:-$(pwd)/runtime/docker-config}"
+mkdir -p "$DOCKER_CONFIG"
+test -f "$DOCKER_CONFIG/config.json" || printf '{}\n' > "$DOCKER_CONFIG/config.json"
 docker build -t flow-sweep-bot .
 mkdir -p runtime
 docker rm -f flow-sweep-bot 2>/dev/null || true
