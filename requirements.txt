@@ -4,4 +4,4 @@ numpy==1.26.4
 boto3>=1.34
 pandas-market-calendars>=4.4.0
 python-dotenv>=1.0.1
-yfinance>=0.2.40
+yfinance==0.2.40

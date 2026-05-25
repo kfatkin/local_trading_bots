@@ -66,15 +66,30 @@ BOT_DASHBOARD_PORT=8765
 
 The Docker launcher mounts `$HOME/.aws` read-only so the container can use the local `trading_bot` AWS profile.
 
+## Code Layout
+
+The runtime entrypoint is intentionally small: `main.py` delegates to the `flow_sweep` package.
+
+- `flow_sweep/config.py`: environment, constants, logging, runtime paths.
+- `flow_sweep/clients.py`: Alpaca, DynamoDB, and NYSE calendar clients.
+- `flow_sweep/state.py`: runtime state, persistence, and locks.
+- `flow_sweep/market_data.py`: Alpaca/Yahoo market data and key level helpers.
+- `flow_sweep/flow_data.py`: `uw-hub` DynamoDB reads and flow-bias scoring.
+- `flow_sweep/strategy.py`: setup preparation, entries, exits, streams, reconciliation.
+- `flow_sweep/dashboard.py`: local dashboard and `/api/status` endpoint.
+- `flow_sweep/app.py`: CLI orchestration for live mode and smoke tests.
+
 ## Dashboard
 
 When the bot is running, open:
 
 ```text
-http://localhost:8765
+http://127.0.0.1:8765
 ```
 
 The dashboard shows the current session, prior session, flow decision for each watched symbol, planned call/put trigger levels, target levels, active positions, pending orders, and recent completed 5-minute bars.
+
+Each watched symbol also has an expandable high-score flow row showing all prior-session `_flow_scores_trading_bot` records above the configured score threshold. These are aggregate score rows from `uw-hub`; contract columns will populate when the underlying score row includes contract fields.
 
 The decision table makes the planned entries explicit:
 
@@ -84,7 +99,7 @@ The decision table makes the planned entries explicit:
 The same status is available as JSON at:
 
 ```text
-http://localhost:8765/api/status
+http://127.0.0.1:8765/api/status
 ```
 
 ## Run Locally
@@ -94,7 +109,33 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-`setup.sh` uses an isolated Docker config at `runtime/docker-config` by default. This avoids WSL/Docker Desktop credential-helper failures while pulling public base images such as `python:3.11-slim`. If you prefer your normal Docker config, run with `USE_HOST_DOCKER_CONFIG=1 ./setup.sh`.
+`setup.sh` uses an isolated Docker config at `runtime/docker-config` by default. This avoids WSL/Docker Desktop credential-helper failures while pulling public base images such as `python:3.11-slim`. It also defaults `DOCKER_BUILDKIT=0` on this machine because the legacy builder path avoids the same credential-helper failure. If you prefer your normal Docker config, run with `USE_HOST_DOCKER_CONFIG=1 ./setup.sh`; if BuildKit is fixed locally, run with `DOCKER_BUILDKIT=1 ./setup.sh`.
+
+Before startup, `setup.sh` stops older local bot containers and tries to kill any local process listening on the dashboard port, which defaults to `8765`.
+
+The script starts the container detached, waits for the dashboard health endpoint, then exits back to your shell. To watch the live bot logs after startup:
+
+```bash
+docker logs -f flow-sweep-bot
+```
+
+Or run startup and immediately follow logs:
+
+```bash
+BOT_FOLLOW_LOGS=1 ./setup.sh
+```
+
+Safe startup smoke test without opening Alpaca streams or submitting orders:
+
+```bash
+python3 main.py --smoke-test
+```
+
+Docker smoke test after building the image:
+
+```bash
+docker run --rm --env-file .env --entrypoint python flow-sweep-bot main.py --smoke-test
+```
 
 Manual Docker run:
 

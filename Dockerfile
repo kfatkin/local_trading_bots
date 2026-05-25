@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py /app/
+COPY flow_sweep /app/flow_sweep
 
 # Run the bot
 CMD ["python", "main.py"]
