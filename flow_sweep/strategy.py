@@ -30,6 +30,13 @@ from .config import (
     PARTIAL_EXIT_PCT,
     PAPER,
     REGULAR_OPEN,
+    RUNNER_EXTENSION_R_MULTIPLE,
+    RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE,
+    RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE,
+    RUNNER_STALL_MINUTES,
+    RUNNER_STALL_R_MULTIPLE,
+    SECOND_PARTIAL_EXIT_PCT,
+    SECOND_PARTIAL_EXIT_R_MULTIPLE,
     SYMBOLS,
     TARGET_R_MULTIPLE,
     TARGET_DELTA,
@@ -949,6 +956,16 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
             "partial_exit_taken": False,
             "partial_exit_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
             "partial_exit_trigger_underlying": risk_plan["breakeven_trigger_underlying"],
+            "runner_profit_floor_entry_multiple": RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE,
+            "runner_profit_floor_partial_multiple": RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE,
+            "runner_extension_r_multiple": RUNNER_EXTENSION_R_MULTIPLE,
+            "runner_extension_reached": False,
+            "runner_max_r_multiple": 0.0,
+            "runner_stall_r_multiple": RUNNER_STALL_R_MULTIPLE,
+            "runner_stall_minutes": RUNNER_STALL_MINUTES,
+            "second_partial_exit_pct": SECOND_PARTIAL_EXIT_PCT,
+            "second_partial_taken": False,
+            "second_partial_trigger_r_multiple": SECOND_PARTIAL_EXIT_R_MULTIPLE,
             "swept_level": signal_name,
             "swept_level_price": signal_price,
             "signal_name": signal_name,
@@ -1136,8 +1153,20 @@ def process_exit_update(order_id, event, order, order_state):
         filled_delta = max(filled_qty - order_state["filled_qty"], 0)
         if filled_delta > 0:
             option_symbol = position.get("option_symbol")
+            exit_reason = order_state.get("reason")
+            filled_avg_price = get_value(order, "filled_avg_price")
             position["total_qty"] = max(position["total_qty"] - filled_delta, 0)
             order_state["filled_qty"] = filled_qty
+            if exit_reason == f"PARTIAL_{BREAKEVEN_TRIGGER_R_MULTIPLE:.2f}R":
+                position["partial_exit_filled_at"] = datetime.now(UTC).isoformat()
+                if filled_avg_price not in (None, ""):
+                    position["partial_exit_fill_price"] = float(filled_avg_price)
+                    update_runner_profit_floor(position, filled_avg_price)
+            elif exit_reason == f"PARTIAL_{SECOND_PARTIAL_EXIT_R_MULTIPLE:.2f}R":
+                position["second_partial_filled_at"] = datetime.now(UTC).isoformat()
+                position["second_partial_taken"] = True
+                if filled_avg_price not in (None, ""):
+                    position["second_partial_fill_price"] = float(filled_avg_price)
             record_trade_event_locked(
                 "exit_fill",
                 symbol=symbol,
@@ -1147,8 +1176,8 @@ def process_exit_update(order_id, event, order, order_state):
                 qty=filled_delta,
                 filled_qty=filled_qty,
                 remaining_qty=position["total_qty"],
-                filled_avg_price=get_value(order, "filled_avg_price"),
-                reason=order_state.get("reason"),
+                filled_avg_price=filled_avg_price,
+                reason=exit_reason,
                 status=get_value(order, "status"),
                 event=event,
             )
@@ -1524,13 +1553,156 @@ def breakeven_trigger_hit(option_type, minute_bar, trigger_underlying):
     return minute_bar["low"] <= trigger_underlying
 
 
+def parse_event_time(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def runner_profit_floor_price(position, reference_option_price=None):
+    candidates = []
+    entry_price = position.get("entry_option_fill_price") or position.get("breakeven_stop_option_price") or position.get("entry_option_ask")
+    if entry_price not in (None, "") and RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE > 0:
+        candidates.append(float(entry_price) * RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE)
+    if reference_option_price not in (None, "") and RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE > 0:
+        candidates.append(float(reference_option_price) * RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE)
+    if not candidates:
+        return None
+    return round(max(candidates), 4)
+
+
+def update_runner_profit_floor(position, reference_option_price=None):
+    floor_price = runner_profit_floor_price(position, reference_option_price)
+    if floor_price is None:
+        return None
+    current_floor = position.get("runner_profit_floor_option_price")
+    if current_floor not in (None, ""):
+        floor_price = max(float(current_floor), floor_price)
+    position["runner_profit_floor_option_price"] = floor_price
+    position["stop_mode"] = "option_profit_floor"
+    return floor_price
+
+
+def position_r_multiple(position, underlying_price):
+    risk = float(position.get("risk_underlying") or 0.0)
+    if risk <= 0 or underlying_price in (None, ""):
+        return 0.0
+    entry = float(position.get("entry_underlying") or 0.0)
+    if position.get("option_type") == "CALL":
+        return (float(underlying_price) - entry) / risk
+    return (entry - float(underlying_price)) / risk
+
+
+def favorable_bar_r_multiple(position, minute_bar):
+    if position.get("option_type") == "CALL":
+        return position_r_multiple(position, minute_bar.get("high"))
+    return position_r_multiple(position, minute_bar.get("low"))
+
+
+def close_bar_r_multiple(position, minute_bar):
+    return position_r_multiple(position, minute_bar.get("close"))
+
+
+def runner_management_ready(position):
+    total_qty = to_int_qty(position.get("total_qty", 0))
+    requested_qty = to_int_qty(position.get("requested_qty", total_qty))
+    return bool(
+        position.get("partial_exit_filled_at")
+        or position.get("partial_exit_skipped_reason")
+        or (requested_qty > 0 and total_qty < requested_qty)
+    )
+
+
+def update_runner_progress(symbol, minute_bar):
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if not position:
+            return None
+        favorable_r = favorable_bar_r_multiple(position, minute_bar)
+        prior_max_r = float(position.get("runner_max_r_multiple") or 0.0)
+        max_r = max(prior_max_r, favorable_r)
+        changed = max_r != prior_max_r
+        position["runner_max_r_multiple"] = round(max_r, 4)
+        if max_r >= RUNNER_EXTENSION_R_MULTIPLE and not position.get("runner_extension_reached"):
+            position["runner_extension_reached"] = True
+            timestamp = minute_bar.get("timestamp")
+            position["runner_extension_reached_at"] = timestamp.isoformat() if hasattr(timestamp, "isoformat") else timestamp
+            changed = True
+        if changed:
+            persist_state_locked()
+        return dict(position)
+
+
+def planned_second_partial_exit_qty(total_qty, original_qty):
+    total_qty = to_int_qty(total_qty)
+    original_qty = to_int_qty(original_qty)
+    if total_qty <= 1 or original_qty <= 1 or SECOND_PARTIAL_EXIT_PCT <= 0:
+        return 0
+    requested_qty = int(original_qty * SECOND_PARTIAL_EXIT_PCT)
+    if requested_qty <= 0:
+        requested_qty = 1
+    return min(requested_qty, total_qty - 1)
+
+
+def request_second_partial_exit(symbol, total_qty):
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        original_qty = to_int_qty(position.get("requested_qty", total_qty)) if position else total_qty
+    exit_qty = planned_second_partial_exit_qty(total_qty, original_qty)
+    if exit_qty <= 0:
+        return False
+    if not execute_exit(symbol, exit_qty, f"PARTIAL_{SECOND_PARTIAL_EXIT_R_MULTIPLE:.2f}R"):
+        return False
+
+    requested_at = datetime.now(UTC).isoformat()
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if position:
+            position["second_partial_taken"] = True
+            position["second_partial_requested_at"] = requested_at
+            position["second_partial_qty_requested"] = exit_qty
+            record_trade_event_locked(
+                "second_partial_exit_requested",
+                symbol=symbol,
+                event_id=f"second-partial-exit-requested:{symbol}:{requested_at}",
+                option_symbol=position.get("option_symbol"),
+                qty=exit_qty,
+                remaining_qty=max(to_int_qty(position.get("total_qty", 0)) - exit_qty, 0),
+                second_partial_exit_pct=SECOND_PARTIAL_EXIT_PCT,
+                second_partial_trigger_r_multiple=SECOND_PARTIAL_EXIT_R_MULTIPLE,
+            )
+            persist_state_locked()
+    return True
+
+
+def runner_stall_exit_hit(position, minute_bar):
+    if RUNNER_STALL_MINUTES <= 0 or not runner_management_ready(position):
+        return False
+    if position.get("runner_extension_reached"):
+        return False
+    partial_time = parse_event_time(position.get("partial_exit_filled_at") or position.get("partial_exit_requested_at"))
+    bar_time = parse_event_time(minute_bar.get("timestamp") or minute_bar.get("close_time"))
+    if not partial_time or not bar_time:
+        return False
+    elapsed_minutes = (bar_time - partial_time).total_seconds() / 60.0
+    if elapsed_minutes < RUNNER_STALL_MINUTES:
+        return False
+    return close_bar_r_multiple(position, minute_bar) <= RUNNER_STALL_R_MULTIPLE
+
+
 def activate_breakeven_stop(symbol):
     with STATE_LOCK:
         position = active_positions.get(symbol)
         if not position or position.get("breakeven_active"):
             return
         position["breakeven_active"] = True
-        position["stop_mode"] = "option_breakeven"
+        runner_floor = update_runner_profit_floor(position)
         position["breakeven_activated_at"] = datetime.now(UTC).isoformat()
         record_trade_event_locked(
             "breakeven_activated",
@@ -1538,10 +1710,11 @@ def activate_breakeven_stop(symbol):
             event_id=f"breakeven:{symbol}:{position.get('breakeven_activated_at')}",
             option_symbol=position.get("option_symbol"),
             breakeven_stop_option_price=position.get("breakeven_stop_option_price"),
+            runner_profit_floor_option_price=runner_floor,
             breakeven_trigger_underlying=position.get("breakeven_trigger_underlying"),
         )
         persist_state_locked()
-    LOGGER.info("%s breakeven stop activated at option price %.2f", symbol, float(position.get("breakeven_stop_option_price") or 0.0))
+    LOGGER.info("%s runner profit floor activated at option price %.2f", symbol, float(position.get("runner_profit_floor_option_price") or 0.0))
 
 
 def planned_partial_exit_qty(total_qty):
@@ -1607,18 +1780,18 @@ def request_partial_exit(symbol, total_qty):
     return True
 
 
-def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
-    if breakeven_price in (None, ""):
+def option_profit_stop_hit(symbol, option_symbol, stop_price, stop_label):
+    if stop_price in (None, ""):
         return False
     try:
         snapshot = option_market_snapshot(option_symbol)
     except Exception as exc:
-        LOGGER.warning("Unable to fetch option snapshot for %s breakeven stop: %s", option_symbol, exc)
+        LOGGER.warning("Unable to fetch option snapshot for %s %s stop: %s", option_symbol, stop_label, exc)
         return False
 
     market_price = snapshot.get("market_price")
     if market_price is None:
-        LOGGER.warning("Unable to evaluate breakeven stop for %s: option market price unavailable", option_symbol)
+        LOGGER.warning("Unable to evaluate %s stop for %s: option market price unavailable", stop_label, option_symbol)
         return False
 
     with STATE_LOCK:
@@ -1630,7 +1803,11 @@ def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
             position["latest_option_quote_time"] = snapshot.get("quote_time")
             persist_state_locked()
 
-    return float(market_price) <= float(breakeven_price)
+    return float(market_price) <= float(stop_price)
+
+
+def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
+    return option_profit_stop_hit(symbol, option_symbol, breakeven_price, "breakeven")
 
 
 def manage_open_position_with_bar(symbol, minute_bar):
@@ -1648,7 +1825,6 @@ def manage_open_position_with_bar(symbol, minute_bar):
         option_symbol = position["option_symbol"]
         breakeven_active = bool(position.get("breakeven_active"))
         breakeven_trigger_underlying = position.get("breakeven_trigger_underlying")
-        breakeven_stop_option_price = position.get("breakeven_stop_option_price")
         partial_exit_taken = bool(position.get("partial_exit_taken"))
 
     if option_type == "CALL":
@@ -1672,9 +1848,25 @@ def manage_open_position_with_bar(symbol, minute_bar):
         if not partial_exit_taken:
             request_partial_exit(symbol, total_qty)
 
-    if breakeven_active and option_breakeven_stop_hit(symbol, option_symbol, breakeven_stop_option_price):
-        execute_exit(symbol, total_qty, "STOP_OPTION_BREAKEVEN")
-        return
+    if breakeven_active:
+        position = update_runner_progress(symbol, minute_bar) or position
+        latest_total_qty = to_int_qty(position.get("total_qty", total_qty))
+        if (
+            runner_management_ready(position)
+            and not position.get("second_partial_taken")
+            and float(position.get("runner_max_r_multiple") or 0.0) >= SECOND_PARTIAL_EXIT_R_MULTIPLE
+        ):
+            request_second_partial_exit(symbol, latest_total_qty)
+            return
+        if runner_stall_exit_hit(position, minute_bar):
+            execute_exit(symbol, latest_total_qty, "STOP_RUNNER_STALL")
+            return
+        stop_option_price = position.get("runner_profit_floor_option_price") or position.get("breakeven_stop_option_price")
+        stop_reason = "STOP_OPTION_PROFIT_FLOOR" if position.get("runner_profit_floor_option_price") else "STOP_OPTION_BREAKEVEN"
+        stop_label = "profit_floor" if position.get("runner_profit_floor_option_price") else "breakeven"
+        if runner_management_ready(position) and option_profit_stop_hit(symbol, option_symbol, stop_option_price, stop_label):
+            execute_exit(symbol, latest_total_qty, stop_reason)
+            return
     if minute_bar["timestamp"].time() >= EOD_EXIT_TIME:
         execute_exit(symbol, total_qty, "EOD_EXIT")
 

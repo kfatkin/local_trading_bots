@@ -25,6 +25,11 @@ from flow_sweep.config import (  # noqa: E402
     PREMARKET_START,
     PARTIAL_EXIT_PCT,
     REGULAR_OPEN,
+    RUNNER_EXTENSION_R_MULTIPLE,
+    RUNNER_STALL_MINUTES,
+    RUNNER_STALL_R_MULTIPLE,
+    SECOND_PARTIAL_EXIT_PCT,
+    SECOND_PARTIAL_EXIT_R_MULTIPLE,
     RUNTIME_DIR,
     SYMBOLS,
     TARGET_R_MULTIPLE,
@@ -225,6 +230,22 @@ def partial_adjusted_r(partial_exit_taken, remaining_r):
     return partial_fraction * BREAKEVEN_TRIGGER_R_MULTIPLE + (1 - partial_fraction) * remaining_r
 
 
+def scaled_exit_r(realized_exits, remaining_r):
+    realized_fraction = sum(fraction for fraction, _r_multiple in realized_exits)
+    realized_r = sum(fraction * r_multiple for fraction, r_multiple in realized_exits)
+    remaining_fraction = max(1.0 - realized_fraction, 0.0)
+    return realized_r + remaining_fraction * remaining_r
+
+
+def add_scaled_exit(realized_exits, requested_fraction, r_multiple):
+    used_fraction = sum(fraction for fraction, _r_multiple in realized_exits)
+    available_fraction = max(1.0 - used_fraction, 0.0)
+    exit_fraction = min(max(requested_fraction, 0.0), available_fraction)
+    if exit_fraction > 0:
+        realized_exits.append((exit_fraction, r_multiple))
+    return exit_fraction
+
+
 def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, breakeven_trigger):
     risk = entry - stop if option_type == "CALL" else stop - entry
     if risk <= 0:
@@ -232,6 +253,10 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
 
     breakeven_active = False
     partial_exit_taken = False
+    second_partial_taken = False
+    runner_extension_reached = False
+    partial_exit_time = None
+    realized_exits = []
     rows = list(bars.iloc[entry_bar_index + 1 :].iterrows())
     if not rows:
         return {
@@ -241,6 +266,7 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
             "r_multiple": 0.0,
             "breakeven_active": False,
             "partial_exit_taken": False,
+            "second_partial_taken": False,
             "partial_exit_r": None,
         }
 
@@ -253,11 +279,15 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
             stop_hit = current["low"] <= stop
             be_trigger_hit = current["high"] >= breakeven_trigger
             be_stop_hit = current["low"] <= entry
+            favorable_r = exit_r(option_type, entry, current["high"], risk)
         else:
             target_hit = current["low"] <= target
             stop_hit = current["high"] >= stop
             be_trigger_hit = current["low"] <= breakeven_trigger
             be_stop_hit = current["high"] >= entry
+            favorable_r = exit_r(option_type, entry, current["low"], risk)
+
+        runner_extension_reached = runner_extension_reached or favorable_r >= RUNNER_EXTENSION_R_MULTIPLE
 
         if target_hit:
             target_r = exit_r(option_type, entry, target, risk)
@@ -265,9 +295,10 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "exit_reason": "TARGET",
                 "exit_price": target,
                 "exit_time": current["close_time"],
-                "r_multiple": partial_adjusted_r(partial_exit_taken, target_r),
+                "r_multiple": scaled_exit_r(realized_exits, target_r),
                 "breakeven_active": breakeven_active,
                 "partial_exit_taken": partial_exit_taken,
+                "second_partial_taken": second_partial_taken,
                 "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
@@ -279,6 +310,7 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "r_multiple": -1.0,
                 "breakeven_active": False,
                 "partial_exit_taken": False,
+                "second_partial_taken": False,
                 "partial_exit_r": None,
             }
 
@@ -287,15 +319,38 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "exit_reason": "BREAKEVEN",
                 "exit_price": entry,
                 "exit_time": current["close_time"],
-                "r_multiple": partial_adjusted_r(partial_exit_taken, 0.0),
+                "r_multiple": scaled_exit_r(realized_exits, 0.0),
                 "breakeven_active": True,
                 "partial_exit_taken": partial_exit_taken,
+                "second_partial_taken": second_partial_taken,
                 "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
         if not breakeven_active and be_trigger_hit:
             breakeven_active = True
             partial_exit_taken = PARTIAL_EXIT_PCT > 0
+            if partial_exit_taken:
+                add_scaled_exit(realized_exits, PARTIAL_EXIT_PCT, BREAKEVEN_TRIGGER_R_MULTIPLE)
+                partial_exit_time = current["close_time"]
+
+        if partial_exit_taken and not second_partial_taken and favorable_r >= SECOND_PARTIAL_EXIT_R_MULTIPLE:
+            second_fraction = add_scaled_exit(realized_exits, SECOND_PARTIAL_EXIT_PCT, SECOND_PARTIAL_EXIT_R_MULTIPLE)
+            second_partial_taken = second_fraction > 0
+
+        if partial_exit_taken and not runner_extension_reached and partial_exit_time and RUNNER_STALL_MINUTES > 0:
+            elapsed_minutes = (current["close_time"] - partial_exit_time).total_seconds() / 60.0
+            close_r = exit_r(option_type, entry, current["close"], risk)
+            if elapsed_minutes >= RUNNER_STALL_MINUTES and close_r <= RUNNER_STALL_R_MULTIPLE:
+                return {
+                    "exit_reason": "RUNNER_STALL",
+                    "exit_price": current["close"],
+                    "exit_time": current["close_time"],
+                    "r_multiple": scaled_exit_r(realized_exits, close_r),
+                    "breakeven_active": breakeven_active,
+                    "partial_exit_taken": partial_exit_taken,
+                    "second_partial_taken": second_partial_taken,
+                    "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
+                }
 
         if current["close_time"].time() >= dt_time(15, 55):
             eod_r = exit_r(option_type, entry, current["close"], risk)
@@ -303,9 +358,10 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
                 "exit_reason": "EOD",
                 "exit_price": current["close"],
                 "exit_time": current["close_time"],
-                "r_multiple": partial_adjusted_r(partial_exit_taken, eod_r),
+                "r_multiple": scaled_exit_r(realized_exits, eod_r),
                 "breakeven_active": breakeven_active,
                 "partial_exit_taken": partial_exit_taken,
+                "second_partial_taken": second_partial_taken,
                 "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
             }
 
@@ -313,9 +369,10 @@ def simulate_exit(option_type, entry_bar_index, bars, entry, stop, target, break
         "exit_reason": "LAST_BAR",
         "exit_price": last_bar["close"],
         "exit_time": last_bar["close_time"],
-        "r_multiple": partial_adjusted_r(partial_exit_taken, exit_r(option_type, entry, last_bar["close"], risk)),
+        "r_multiple": scaled_exit_r(realized_exits, exit_r(option_type, entry, last_bar["close"], risk)),
         "breakeven_active": breakeven_active,
         "partial_exit_taken": partial_exit_taken,
+        "second_partial_taken": second_partial_taken,
         "partial_exit_r": BREAKEVEN_TRIGGER_R_MULTIPLE if partial_exit_taken else None,
     }
 
@@ -513,6 +570,9 @@ def backtest_symbol(symbol, schedule, session_indices):
                             "partial_exit_taken": exit_result.get("partial_exit_taken"),
                             "partial_exit_pct": PARTIAL_EXIT_PCT if exit_result.get("partial_exit_taken") else None,
                             "partial_exit_r": exit_result.get("partial_exit_r"),
+                            "second_partial_taken": exit_result.get("second_partial_taken"),
+                            "second_partial_exit_pct": SECOND_PARTIAL_EXIT_PCT if exit_result.get("second_partial_taken") else None,
+                            "second_partial_exit_r": SECOND_PARTIAL_EXIT_R_MULTIPLE if exit_result.get("second_partial_taken") else None,
                             **(metadata.get("event_fields") or {}),
                         }
                     )
@@ -645,7 +705,9 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         f"- Sweep and confirmation strength uses a {fmt_pct(ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT)} candle-range close test, and sweep candles must clear the level by at least {fmt_pct(ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT)} of candle range.",
         f"- Planned targets above {ENTRY_MAX_TARGET_R_MULTIPLE:.2f}R are skipped as low-quality/tight-risk entries.",
         "- Results are measured in underlying R multiples, not historical option premium PnL.",
-        f"- A {fmt_pct(PARTIAL_EXIT_PCT)} partial is credited at the {BREAKEVEN_TRIGGER_R_MULTIPLE:.2f}R trigger; the remainder is managed with a breakeven stop approximation because historical option bid/ask marks are not replayed here.",
+        f"- A {fmt_pct(PARTIAL_EXIT_PCT)} partial is credited at the {BREAKEVEN_TRIGGER_R_MULTIPLE:.2f}R trigger; a second {fmt_pct(SECOND_PARTIAL_EXIT_PCT)} scale-out is credited at {SECOND_PARTIAL_EXIT_R_MULTIPLE:.2f}R when reached.",
+        f"- Runner stalls exit after {RUNNER_STALL_MINUTES} minutes if price never reaches {RUNNER_EXTENSION_R_MULTIPLE:.2f}R and closes back to {RUNNER_STALL_R_MULTIPLE:.2f}R or worse.",
+        "- The live runner option profit floor is not replayed exactly because historical option bid/ask marks are not available; the underlying replay keeps the prior breakeven approximation for that piece.",
         "- Intrabar conflicts follow the live bot priority: target first, then initial stop, then breakeven activation/stop, then EOD.",
         "",
         "## Summary",
