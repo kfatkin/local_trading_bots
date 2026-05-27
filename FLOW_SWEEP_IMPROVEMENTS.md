@@ -2,7 +2,7 @@
 
 ## Implemented In This Pass
 
-- Start entries at 10:00 ET instead of 09:45 ET to avoid the highest-noise opening churn from the latest backtest, while allowing entries through 15:00 ET so the bot is not restricted to a narrow morning-only window.
+- Start entries at 10:00 ET instead of 09:45 ET to avoid the highest-noise opening churn from the latest backtest, while allowing entries until before 14:00 ET so the bot is not restricted to a narrow morning-only window.
 - Treat the first sweep/reclaim candle as a signal only; enter only after the next 5-minute candle confirms.
 - Require the sweep candle to close meaningfully back through the swept level:
   - calls: close in the upper half and at least 10% of candle range above the swept support;
@@ -11,7 +11,7 @@
 - Skip entries where the planned opposing-level target is above 8R, which usually means the risk is too tight or the nearest opposing level is too far away for this scalp structure.
 - Add a continuation fair value gap strategy as an alternative, bias-aligned setup. The live bot and backtest now allow both strategies, with the first valid armed setup winning for a symbol.
 - Raise the default premium-consensus requirement from 60% to 70% so mixed prior-session flow is filtered out.
-- Restrict new entries to the higher-quality morning window from 10:00 ET until before 12:00 ET.
+- Restrict new entries to the higher-quality window from 10:00 ET until before 14:00 ET.
 - Keep the continuation FVG implementation available behind `FLOW_SWEEP_ENABLE_CONTINUATION_FVG`, but disable it by default until it has a better standalone baseline.
 - Add a 50% partial-profit request at the 1.5R breakeven trigger when the live position has enough contracts to leave a runner.
 

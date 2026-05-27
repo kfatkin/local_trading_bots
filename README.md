@@ -33,9 +33,9 @@ Before the trading session, it queries the `uw-data` DynamoDB table with AWS pro
 
 For each symbol, it premium-weights bullish and bearish high-score flow. A setup is enabled only when one side has at least 70% of the total directional premium.
 
-For bullish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and noon ET, it buys calls after a confirmed sweep/reclaim of a watched low.
+For bullish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 14:00 ET, it buys calls after a confirmed sweep/reclaim of a watched low.
 
-For bearish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and noon ET, it buys puts after a confirmed sweep/rejection of a watched high.
+For bearish flow, the bot trades only in the direction of the prior-session high-score flow bias. Between 10:00 and 14:00 ET, it buys puts after a confirmed sweep/rejection of a watched high.
 
 The continuation fair value gap model is still available for research, but it is disabled by default because the first combined sample underperformed the sweep-only baseline. Set `FLOW_SWEEP_ENABLE_CONTINUATION_FVG=true` to include it in live runs and backtests.
 
