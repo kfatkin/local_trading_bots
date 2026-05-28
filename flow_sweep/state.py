@@ -13,7 +13,7 @@ CONTEXT_LOCK = threading.RLock()
 active_positions = {}
 pending_entry_orders = {}
 pending_exit_orders = {}
-daily_trade_state = {"session": None, "traded_symbols": [], "events": []}
+daily_trade_state = {"session": None, "traded_symbols": [], "events": [], "daily_profit_lock": {}}
 
 daily_context = {
     "session": None,
@@ -70,9 +70,10 @@ def load_state_from_disk():
         pending_exit_orders.clear()
         pending_exit_orders.update(snapshot.get("pending_exit_orders", {}))
         daily_trade_state.clear()
-        daily_trade_state.update(snapshot.get("daily_trade_state", {"session": None, "traded_symbols": [], "events": []}))
+        daily_trade_state.update(snapshot.get("daily_trade_state", {"session": None, "traded_symbols": [], "events": [], "daily_profit_lock": {}}))
         daily_trade_state.setdefault("traded_symbols", [])
         daily_trade_state.setdefault("events", [])
+        daily_trade_state.setdefault("daily_profit_lock", {})
 
     LOGGER.info(
         "Loaded local state: active_positions=%s pending_entry_orders=%s pending_exit_orders=%s traded_symbols=%s",
@@ -91,6 +92,7 @@ def reset_daily_trade_state_if_needed(session_date):
         daily_trade_state["session"] = session_key
         daily_trade_state["traded_symbols"] = []
         daily_trade_state["events"] = []
+        daily_trade_state["daily_profit_lock"] = {}
         persist_state_locked()
 
 

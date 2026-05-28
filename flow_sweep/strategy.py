@@ -15,6 +15,11 @@ from .config import (
     CONTINUATION_DISPLACEMENT_LOOKBACK,
     CONTINUATION_DISPLACEMENT_MIN_RANGE_MULTIPLE,
     CONTINUATION_MAX_ZONE_AGE_BARS,
+    DAILY_PROFIT_LOCK_BLOCKS_NEW_ENTRIES,
+    DAILY_PROFIT_LOCK_DRAWDOWN_PCT,
+    DAILY_PROFIT_LOCK_ENABLED,
+    DAILY_PROFIT_LOCK_FLOOR_PCT,
+    DAILY_PROFIT_LOCK_TRIGGER_PCT,
     ENABLE_CONTINUATION_FVG,
     ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT,
     ENTRY_MAX_TARGET_R_MULTIPLE,
@@ -26,9 +31,16 @@ from .config import (
     FLOW_SCORE_PARTITION,
     LOGGER,
     MIN_FLOW_SCORE,
+    NO_PROGRESS_EXIT_ENABLED,
+    NO_PROGRESS_MIN_OPTION_GAIN_PCT,
+    NO_PROGRESS_MINUTES,
     OPTION_PREVIEW_REFRESH_SECONDS,
     PARTIAL_EXIT_PCT,
     PAPER,
+    PRE_BREAKEVEN_OPTION_FLOOR_PCT,
+    PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT,
+    PRE_BREAKEVEN_OPTION_LOCK_ENABLED,
+    PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT,
     REGULAR_OPEN,
     RUNNER_EXTENSION_R_MULTIPLE,
     RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE,
@@ -60,6 +72,7 @@ from .state import (
     active_positions,
     current_setup,
     daily_context,
+    daily_trade_state,
     five_minute_builders,
     last_completed_bars,
     mark_symbol_traded,
@@ -798,6 +811,15 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
     with STATE_LOCK:
         if symbol in active_positions or symbol in pending_entry_orders.values():
             return False
+    if daily_profit_lock_blocks_entries():
+        record_trade_event(
+            "entry_blocked",
+            symbol=symbol,
+            event_id=f"entry-blocked-daily-profit-lock:{symbol}",
+            reason="daily profit lock active",
+            daily_profit_lock=daily_trade_state.get("daily_profit_lock"),
+        )
+        return False
     if was_symbol_traded_today(symbol):
         record_trade_event("entry_skipped", symbol=symbol, event_id=f"entry-skipped-already-traded:{symbol}", reason="symbol already traded today")
         return False
@@ -966,6 +988,13 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
             "second_partial_exit_pct": SECOND_PARTIAL_EXIT_PCT,
             "second_partial_taken": False,
             "second_partial_trigger_r_multiple": SECOND_PARTIAL_EXIT_R_MULTIPLE,
+            "pre_breakeven_option_lock_enabled": PRE_BREAKEVEN_OPTION_LOCK_ENABLED,
+            "pre_breakeven_option_lock_trigger_pct": PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT,
+            "pre_breakeven_option_floor_pct": PRE_BREAKEVEN_OPTION_FLOOR_PCT,
+            "pre_breakeven_option_hard_stop_loss_pct": PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT,
+            "no_progress_exit_enabled": NO_PROGRESS_EXIT_ENABLED,
+            "no_progress_minutes": NO_PROGRESS_MINUTES,
+            "no_progress_min_option_gain_pct": NO_PROGRESS_MIN_OPTION_GAIN_PCT,
             "swept_level": signal_name,
             "swept_level_price": signal_price,
             "signal_name": signal_name,
@@ -1387,6 +1416,17 @@ def in_entry_window(close_time_et):
 
 def process_completed_five_minute_bar(symbol, bar):
     refresh_contract_previews_if_needed(reason="five_minute_bar")
+    if daily_profit_lock_blocks_entries():
+        pending_sweep_confirmations.pop(symbol, None)
+        continuation_contexts.pop(symbol, None)
+        record_trade_event(
+            "entry_blocked",
+            symbol=symbol,
+            event_id=f"entry-blocked-daily-profit-lock:{symbol}:{bar['close_time'].isoformat()}",
+            reason="daily profit lock active",
+            daily_profit_lock=daily_trade_state.get("daily_profit_lock"),
+        )
+        return
 
     close_clock = bar["close_time"].time()
     if close_clock >= ENTRY_WINDOW_END:
@@ -1810,6 +1850,244 @@ def option_breakeven_stop_hit(symbol, option_symbol, breakeven_price):
     return option_profit_stop_hit(symbol, option_symbol, breakeven_price, "breakeven")
 
 
+def entry_option_price(position):
+    value = position.get("entry_option_fill_price") or position.get("breakeven_stop_option_price") or position.get("entry_option_ask")
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def current_option_market_price(symbol, option_symbol):
+    try:
+        snapshot = option_market_snapshot(option_symbol)
+    except Exception as exc:
+        LOGGER.warning("Unable to fetch option snapshot for %s pre-breakeven risk: %s", option_symbol, exc)
+        return None
+
+    market_price = snapshot.get("market_price")
+    if market_price is None:
+        LOGGER.warning("Unable to evaluate pre-breakeven risk for %s: option market price unavailable", option_symbol)
+        return None
+
+    with STATE_LOCK:
+        position = active_positions.get(symbol)
+        if position:
+            position["latest_option_market_price"] = market_price
+            position["latest_option_bid"] = snapshot.get("bid")
+            position["latest_option_ask"] = snapshot.get("ask")
+            position["latest_option_quote_time"] = snapshot.get("quote_time")
+            persist_state_locked()
+    return float(market_price)
+
+
+def no_progress_exit_hit(position, minute_bar, entry_price, market_price):
+    if not NO_PROGRESS_EXIT_ENABLED or NO_PROGRESS_MINUTES <= 0:
+        return False
+    entry_time = parse_event_time(position.get("entry_filled_at") or position.get("entry_submitted_at") or position.get("signal_time"))
+    bar_time = parse_event_time(minute_bar.get("timestamp") or minute_bar.get("close_time"))
+    if not entry_time or not bar_time:
+        return False
+    elapsed_minutes = (bar_time - entry_time).total_seconds() / 60.0
+    if elapsed_minutes < NO_PROGRESS_MINUTES:
+        return False
+    gain_pct = (market_price - entry_price) / entry_price
+    with STATE_LOCK:
+        active = active_positions.get(position.get("symbol"))
+        if active:
+            active["pre_breakeven_no_progress_elapsed_minutes"] = round(elapsed_minutes, 2)
+            active["pre_breakeven_no_progress_gain_pct"] = round(gain_pct, 4)
+            persist_state_locked()
+    return gain_pct <= NO_PROGRESS_MIN_OPTION_GAIN_PCT
+
+
+def manage_pre_breakeven_option_risk(symbol, position, minute_bar):
+    option_symbol = position.get("option_symbol")
+    if not option_symbol:
+        return False
+    entry_price = entry_option_price(position)
+    if entry_price is None or entry_price <= 0:
+        return False
+
+    market_price = current_option_market_price(symbol, option_symbol)
+    if market_price is None:
+        return False
+
+    floor_price = None
+    with STATE_LOCK:
+        active = active_positions.get(symbol)
+        if active:
+            peak_price = max(float(active.get("pre_breakeven_peak_option_price") or 0.0), market_price)
+            active["pre_breakeven_peak_option_price"] = round(peak_price, 4)
+            floor_price = active.get("pre_breakeven_option_floor_price")
+            if floor_price not in (None, ""):
+                floor_price = float(floor_price)
+            if (
+                PRE_BREAKEVEN_OPTION_LOCK_ENABLED
+                and PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT > 0
+                and market_price >= entry_price * (1.0 + PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT)
+            ):
+                next_floor = round(entry_price * (1.0 + PRE_BREAKEVEN_OPTION_FLOOR_PCT), 4)
+                if floor_price is None or next_floor > floor_price:
+                    active["pre_breakeven_option_floor_price"] = next_floor
+                    active["pre_breakeven_option_floor_armed_at"] = datetime.now(UTC).isoformat()
+                    active["stop_mode"] = "pre_breakeven_option_floor"
+                    floor_price = next_floor
+                    record_trade_event_locked(
+                        "pre_breakeven_option_floor_armed",
+                        symbol=symbol,
+                        event_id=f"pre-breakeven-floor:{symbol}:{active['pre_breakeven_option_floor_armed_at']}",
+                        option_symbol=option_symbol,
+                        entry_option_price=entry_price,
+                        market_price=market_price,
+                        floor_price=floor_price,
+                        trigger_pct=PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT,
+                        floor_pct=PRE_BREAKEVEN_OPTION_FLOOR_PCT,
+                    )
+            persist_state_locked()
+
+    if floor_price is not None and market_price <= floor_price:
+        execute_exit(symbol, to_int_qty(position.get("total_qty", 0)), "STOP_PRE_BREAKEVEN_OPTION_FLOOR")
+        return True
+
+    if PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT > 0:
+        hard_stop = entry_price * (1.0 - PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT)
+        if market_price <= hard_stop:
+            execute_exit(symbol, to_int_qty(position.get("total_qty", 0)), "STOP_PRE_BREAKEVEN_OPTION_LOSS")
+            return True
+
+    if no_progress_exit_hit(position, minute_bar, entry_price, market_price):
+        execute_exit(symbol, to_int_qty(position.get("total_qty", 0)), "STOP_PRE_BREAKEVEN_NO_PROGRESS")
+        return True
+    return False
+
+
+def account_equity_snapshot():
+    try:
+        account = trade_client.get_account()
+    except Exception as exc:
+        LOGGER.warning("Unable to load Alpaca account for daily profit lock: %s", exc)
+        return None
+
+    current = None
+    for field in ("portfolio_value", "equity", "cash"):
+        value = get_value(account, field)
+        if value not in (None, "") and float(value) > 0:
+            current = float(value)
+            break
+    if current is None:
+        return None
+
+    baseline_value = get_value(account, "last_equity")
+    baseline = float(baseline_value) if baseline_value not in (None, "") and float(baseline_value) > 0 else current
+    return {"current_equity": current, "baseline_equity": baseline}
+
+
+def refresh_daily_profit_lock(now=None, flatten_on_trigger=False):
+    now = now or datetime.now(ET)
+    with STATE_LOCK:
+        state = daily_trade_state.setdefault("daily_profit_lock", {})
+        if not DAILY_PROFIT_LOCK_ENABLED:
+            state["enabled"] = False
+            persist_state_locked()
+            return state.copy()
+
+        session = now.date().isoformat()
+        if state.get("session") != session:
+            state.clear()
+            state.update({"enabled": True, "session": session})
+            persist_state_locked()
+
+    snapshot = account_equity_snapshot()
+    if snapshot is None:
+        with STATE_LOCK:
+            return dict(daily_trade_state.setdefault("daily_profit_lock", {}))
+
+    current_equity = snapshot["current_equity"]
+    triggered_now = False
+    with STATE_LOCK:
+        state = daily_trade_state.setdefault("daily_profit_lock", {})
+        day_open_equity = float(state.get("day_open_equity") or 0.0)
+        if day_open_equity <= 0:
+            day_open_equity = snapshot["baseline_equity"] or current_equity
+            state["day_open_equity"] = round(day_open_equity, 2)
+
+        peak_equity = max(float(state.get("peak_equity") or day_open_equity), current_equity)
+        state["peak_equity"] = round(peak_equity, 2)
+        state["latest_equity"] = round(current_equity, 2)
+        state["latest_checked_at"] = now.isoformat()
+        latest_gain_pct = (current_equity - day_open_equity) / day_open_equity
+        peak_gain_pct = (peak_equity - day_open_equity) / day_open_equity
+        state["latest_gain_pct"] = round(latest_gain_pct, 5)
+        state["peak_gain_pct"] = round(peak_gain_pct, 5)
+
+        if peak_gain_pct >= DAILY_PROFIT_LOCK_TRIGGER_PCT:
+            if not state.get("active"):
+                state["active"] = True
+                state["activated_at"] = now.isoformat()
+                record_trade_event_locked(
+                    "daily_profit_lock_activated",
+                    symbol="*",
+                    event_id=f"daily-profit-lock-activated:{now.isoformat()}",
+                    day_open_equity=day_open_equity,
+                    peak_equity=peak_equity,
+                    peak_gain_pct=peak_gain_pct,
+                    trigger_pct=DAILY_PROFIT_LOCK_TRIGGER_PCT,
+                )
+            floor_by_pct = day_open_equity * (1.0 + DAILY_PROFIT_LOCK_FLOOR_PCT)
+            floor_by_drawdown = peak_equity - (day_open_equity * DAILY_PROFIT_LOCK_DRAWDOWN_PCT)
+            lock_floor = max(floor_by_pct, floor_by_drawdown)
+            state["lock_floor_equity"] = round(lock_floor, 2)
+            state["lock_floor_gain_pct"] = round((lock_floor - day_open_equity) / day_open_equity, 5)
+            state["max_drawdown_pct"] = DAILY_PROFIT_LOCK_DRAWDOWN_PCT
+
+            if current_equity <= lock_floor and not state.get("triggered"):
+                state["triggered"] = True
+                state["triggered_at"] = now.isoformat()
+                state["trigger_reason"] = "daily equity gave back to profit-lock floor"
+                triggered_now = True
+                record_trade_event_locked(
+                    "daily_profit_lock_triggered",
+                    symbol="*",
+                    event_id=f"daily-profit-lock-triggered:{now.isoformat()}",
+                    day_open_equity=day_open_equity,
+                    peak_equity=peak_equity,
+                    current_equity=current_equity,
+                    lock_floor_equity=lock_floor,
+                    latest_gain_pct=latest_gain_pct,
+                    peak_gain_pct=peak_gain_pct,
+                )
+        persist_state_locked()
+        result = dict(state)
+
+    if flatten_on_trigger and (triggered_now or result.get("triggered")):
+        flatten_for_daily_profit_lock()
+    return result
+
+
+def daily_profit_lock_blocks_entries():
+    if not DAILY_PROFIT_LOCK_ENABLED:
+        return False
+    with STATE_LOCK:
+        state = daily_trade_state.get("daily_profit_lock") or {}
+        return bool(state.get("triggered") or (DAILY_PROFIT_LOCK_BLOCKS_NEW_ENTRIES and state.get("active")))
+
+
+def daily_profit_lock_triggered():
+    with STATE_LOCK:
+        return bool((daily_trade_state.get("daily_profit_lock") or {}).get("triggered"))
+
+
+def flatten_for_daily_profit_lock():
+    with STATE_LOCK:
+        positions = [
+            (symbol, to_int_qty(position.get("total_qty", 0)))
+            for symbol, position in active_positions.items()
+            if position.get("managed", True) and to_int_qty(position.get("total_qty", 0)) > 0
+        ]
+    for symbol, qty in positions:
+        execute_exit(symbol, qty, "DAILY_PROFIT_LOCK")
+
+
 def manage_open_position_with_bar(symbol, minute_bar):
     with STATE_LOCK:
         position = active_positions.get(symbol)
@@ -1840,6 +2118,9 @@ def manage_open_position_with_bar(symbol, minute_bar):
         return
     if not breakeven_active and stop_hit:
         execute_exit(symbol, total_qty, "STOP_SWEEP_EXTREME")
+        return
+
+    if not breakeven_active and manage_pre_breakeven_option_risk(symbol, position, minute_bar):
         return
 
     if not breakeven_active and breakeven_trigger_hit(option_type, minute_bar, breakeven_trigger_underlying):
@@ -1875,6 +2156,9 @@ async def handle_bar(bar):
     symbol = bar.symbol
     timestamp_et = bar_timestamp_et(bar)
     prepare_daily_context(timestamp_et)
+    refresh_daily_profit_lock(timestamp_et, flatten_on_trigger=True)
+    if daily_profit_lock_triggered():
+        return
 
     minute_bar = minute_bar_dict(bar, timestamp_et)
     manage_open_position_with_bar(symbol, minute_bar)

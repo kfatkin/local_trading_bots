@@ -48,7 +48,9 @@ Contracts are selected from the nearest active expiration, including 0DTE when a
 - If the 5% allocation cannot buy one contract, the bot can still buy one contract when that contract costs no more than 20% of account balance.
 - Sweep entries use the sweep candle extreme as the stop. Continuation FVG entries use the structure swing that defined the break as the stop.
 - Target is bot-managed. The bot uses the closest opposing key level only when that level offers at least 2R from the underlying entry-to-stop distance; otherwise it uses a fixed 2R underlying target so trades can still run into all-time highs or lows.
+- Before the underlying reaches 1.5R, the bot now arms an option-price floor after a 15% premium gain, exits on a 30% option premium loss, and cuts no-progress trades after 90 minutes when the option is not green.
 - Once the underlying reaches 1.5R, the bot attempts to sell 50% of the position when there are enough contracts to leave a runner, then switches the remaining position to option breakeven and exits if the option market price falls back to the entry option price.
+- Once daily account equity reaches a 2% high-water gain, the bot blocks new entries and flattens managed Flow Sweep positions if equity gives back to the configured daily profit-lock floor.
 - Remaining positions are closed near end of day at 15:55 ET.
 - Local runtime state is persisted under `runtime/state.json` so open option positions can be reconciled after restart.
 
@@ -76,6 +78,25 @@ FLOW_SWEEP_TARGET_DELTA=0.30
 FLOW_SWEEP_TARGET_R_MULTIPLE=2.0
 FLOW_SWEEP_BREAKEVEN_TRIGGER_R_MULTIPLE=1.5
 FLOW_SWEEP_PARTIAL_EXIT_PCT=0.50
+FLOW_SWEEP_RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE=1.15
+FLOW_SWEEP_RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE=0.85
+FLOW_SWEEP_RUNNER_EXTENSION_R_MULTIPLE=2.0
+FLOW_SWEEP_RUNNER_STALL_R_MULTIPLE=1.25
+FLOW_SWEEP_RUNNER_STALL_MINUTES=60
+FLOW_SWEEP_SECOND_PARTIAL_EXIT_R_MULTIPLE=2.5
+FLOW_SWEEP_SECOND_PARTIAL_EXIT_PCT=0.25
+FLOW_SWEEP_PRE_BREAKEVEN_OPTION_LOCK_ENABLED=true
+FLOW_SWEEP_PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT=0.15
+FLOW_SWEEP_PRE_BREAKEVEN_OPTION_FLOOR_PCT=0.02
+FLOW_SWEEP_PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT=0.30
+FLOW_SWEEP_NO_PROGRESS_EXIT_ENABLED=true
+FLOW_SWEEP_NO_PROGRESS_MINUTES=90
+FLOW_SWEEP_NO_PROGRESS_MIN_OPTION_GAIN_PCT=0.0
+FLOW_SWEEP_DAILY_PROFIT_LOCK_ENABLED=true
+FLOW_SWEEP_DAILY_PROFIT_LOCK_TRIGGER_PCT=0.02
+FLOW_SWEEP_DAILY_PROFIT_LOCK_FLOOR_PCT=0.0125
+FLOW_SWEEP_DAILY_PROFIT_LOCK_DRAWDOWN_PCT=0.0075
+FLOW_SWEEP_DAILY_PROFIT_LOCK_BLOCKS_NEW_ENTRIES=true
 FLOW_SWEEP_ENTRY_RECLAIM_CLOSE_MIN_RANGE_PCT=0.50
 FLOW_SWEEP_ENTRY_LEVEL_CLEARANCE_MIN_RANGE_PCT=0.10
 FLOW_SWEEP_ENTRY_MAX_TARGET_R_MULTIPLE=8.0
