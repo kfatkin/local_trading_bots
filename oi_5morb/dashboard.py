@@ -355,11 +355,11 @@ def closed_positions_payload(events):
 
 def latest_backtest_payload():
     backtest_dir = RUNTIME_DIR / "backtests"
-    markdown_files = sorted(backtest_dir.glob("flow_sweep_backtest_*.md"), key=lambda path: path.stat().st_mtime, reverse=True)
+    markdown_files = sorted(backtest_dir.glob("oi_5morb_backtest_*.md"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not markdown_files:
         return {
             "available": False,
-            "reason": "No backtest logs found. Run python3 scripts/backtest_flow_sweep.py --sessions 40 to generate one.",
+            "reason": "No backtest logs found. Run python3 scripts/backtest_oi_5morb.py --sessions 40 to generate one.",
             "directory": str(backtest_dir),
         }
 
@@ -1162,7 +1162,7 @@ def start_dashboard_thread():
         LOGGER.error("Dashboard failed to start on %s:%s: %s", DASHBOARD_HOST, DASHBOARD_PORT, exc)
         return None
 
-    thread = threading.Thread(target=server.serve_forever, name="flow-sweep-dashboard", daemon=True)
+    thread = threading.Thread(target=server.serve_forever, name="oi-5morb-dashboard", daemon=True)
     thread.start()
     display_host = "127.0.0.1" if DASHBOARD_HOST in {"0.0.0.0", "::"} else DASHBOARD_HOST
     LOGGER.info("Dashboard running at http://%s:%s", display_host, DASHBOARD_PORT)

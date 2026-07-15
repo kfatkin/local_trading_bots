@@ -770,7 +770,7 @@ def sweep_entry_metadata(setup, swept_level, signal_bar, sweep_bar):
     option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
     stop_underlying = sweep_bar["low"] if option_type == "CALL" else sweep_bar["high"]
     return {
-        "setup_type": "flow_sweep",
+        "setup_type": "oi_5morb",
         "signal_name": swept_level.name,
         "signal_price": swept_level.price,
         "signal_label": f"confirmed {swept_level.name} sweep",

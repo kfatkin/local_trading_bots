@@ -1,4 +1,4 @@
-from flow_sweep.app import main
+from oi_5morb.app import main
 
 
 if __name__ == "__main__":

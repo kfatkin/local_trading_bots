@@ -2,6 +2,7 @@ import json
 import re
 from collections import defaultdict
 from datetime import date, datetime
+from base64 import b64decode
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -12,6 +13,7 @@ from botocore.config import Config
 from .config import (
     ET,
     LOGGER,
+    OI_CHANGE_API_URL,
     OI_CHANGE_AWS_PROFILE,
     OI_CHANGE_AWS_REGION,
     OI_CHANGE_SECRET_NAME,
@@ -33,16 +35,85 @@ YAHOO_BATCH_SIZE = 100
 EXCLUDED_QUOTE_TYPES = {"ETF", "INDEX", "MUTUALFUND"}
 API_KEY_FIELDS = (
     "unusual_whales",
+    "unusualwhales",
     "unusual_whales_api_key",
+    "unusualwhales_api_key",
     "unusualWhales",
+    "unusualWhalesApiKey",
+    "unusual_whales_api",
     "uw_api_key",
     "uw-api-key",
+    "uw",
 )
+
+
+def _normalize_key_name(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _looks_like_uw_key(value):
+    normalized = str(value or "").strip()
+    if len(normalized) < 12:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9_\-\.]+$", normalized))
+
+
+def _extract_uw_key_from_payload(payload):
+    field_aliases = {_normalize_key_name(name) for name in API_KEY_FIELDS}
+
+    def walk(node):
+        if isinstance(node, dict):
+            # First pass: direct known field aliases.
+            for raw_key, raw_value in node.items():
+                key = _normalize_key_name(raw_key)
+                if key in field_aliases and isinstance(raw_value, str) and raw_value.strip():
+                    return raw_value.strip()
+
+            # Second pass: fuzzy key matching.
+            for raw_key, raw_value in node.items():
+                key = _normalize_key_name(raw_key)
+                if "unusual" in key and "whale" in key and isinstance(raw_value, str) and raw_value.strip():
+                    return raw_value.strip()
+                if key.startswith("uw") and "key" in key and isinstance(raw_value, str) and raw_value.strip():
+                    return raw_value.strip()
+
+            # Third pass: recurse nested structures.
+            for raw_value in node.values():
+                nested = walk(raw_value)
+                if nested:
+                    return nested
+            return None
+
+        if isinstance(node, list):
+            for item in node:
+                nested = walk(item)
+                if nested:
+                    return nested
+            return None
+
+        if isinstance(node, str) and _looks_like_uw_key(node):
+            return node.strip()
+        return None
+
+    return walk(payload)
 
 
 def _http_json(url, headers=None, params=None, timeout=UW_REQUEST_TIMEOUT_SECONDS):
     query = f"?{urlencode(params)}" if params else ""
-    request = Request(f"{url}{query}", headers=headers or {})
+    request_headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+    }
+    if headers:
+        request_headers.update(headers)
+    request = Request(f"{url}{query}", headers=request_headers)
     try:
         with urlopen(request, timeout=timeout) as response:
             payload = response.read().decode("utf-8")
@@ -70,12 +141,26 @@ def resolve_uw_api_key():
 
     client = _secrets_manager_client()
     response = client.get_secret_value(SecretId=OI_CHANGE_SECRET_NAME)
-    secret = response.get("SecretString") or "{}"
-    payload = json.loads(secret)
-    for field in API_KEY_FIELDS:
-        value = str(payload.get(field) or "").strip()
-        if value:
-            return value
+    secret_text = response.get("SecretString")
+    if not secret_text and response.get("SecretBinary"):
+        secret_text = b64decode(response.get("SecretBinary")).decode("utf-8", errors="replace")
+
+    secret_text = (secret_text or "").strip()
+    if not secret_text:
+        raise RuntimeError(f"Secret {OI_CHANGE_SECRET_NAME} is empty; cannot resolve a Unusual Whales API key")
+
+    try:
+        payload = json.loads(secret_text)
+    except json.JSONDecodeError:
+        if _looks_like_uw_key(secret_text):
+            return secret_text
+        raise RuntimeError(
+            f"Secret {OI_CHANGE_SECRET_NAME} is not valid JSON and does not look like a direct API key string"
+        )
+
+    value = _extract_uw_key_from_payload(payload)
+    if value:
+        return value
     raise RuntimeError(f"Secret {OI_CHANGE_SECRET_NAME} is missing a Unusual Whales API key field")
 
 
@@ -208,10 +293,13 @@ def _should_exclude_symbol(summary):
 def fetch_oi_change_rows():
     api_key = resolve_uw_api_key()
     payload = _http_json(
-        f"{UW_API_BASE_URL}/api/market/oi-change",
+        OI_CHANGE_API_URL or f"{UW_API_BASE_URL}/api/market/oi-change",
         headers={
             "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json, text/plain",
+            "X-API-Key": api_key,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://unusualwhales.com",
+            "Referer": "https://unusualwhales.com/",
             "UW-CLIENT-API-ID": UW_CLIENT_API_ID,
         },
     )
@@ -328,7 +416,12 @@ def _candidate_display_row(candidate):
 
 def load_morning_watchlist(now_et=None):
     now_et = now_et or datetime.now(ET)
-    raw_rows = fetch_oi_change_rows()
+    try:
+        raw_rows = fetch_oi_change_rows()
+    except Exception as exc:
+        # Fail open so the bot and dashboard still run even if UW temporarily blocks API access.
+        LOGGER.warning("Morning OI watchlist fetch failed; continuing with empty watchlist: %s", exc)
+        return {}
     normalized = [row for row in (_normalize_row(item) for item in raw_rows if isinstance(item, dict)) if row]
 
     quote_types = {}

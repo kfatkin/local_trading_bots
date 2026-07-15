@@ -23,7 +23,7 @@ fi
 
 stop_local_bot_containers() {
 	echo "Stopping existing local bot containers..."
-	docker rm -f flow-sweep-bot powerbar-bot 2>/dev/null || true
+	docker rm -f oi-5morb-bot powerbar-bot 2>/dev/null || true
 	local published_containers
 	published_containers="$(docker ps --filter "publish=${DASHBOARD_PORT}" --format '{{.ID}}' 2>/dev/null || true)"
 	if [[ -n "$published_containers" ]]; then
@@ -60,9 +60,9 @@ wait_for_dashboard() {
 			return 0
 		fi
 
-		if ! docker ps --format '{{.Names}}' | grep -qx 'flow-sweep-bot'; then
-			echo "flow-sweep-bot exited before the dashboard became ready. Recent logs:"
-			docker logs --tail 80 flow-sweep-bot 2>/dev/null || true
+		if ! docker ps --format '{{.Names}}' | grep -qx 'oi-5morb-bot'; then
+			echo "oi-5morb-bot exited before the dashboard became ready. Recent logs:"
+			docker logs --tail 80 oi-5morb-bot 2>/dev/null || true
 			return 1
 		fi
 
@@ -70,7 +70,7 @@ wait_for_dashboard() {
 	done
 
 	echo "Dashboard did not become ready at ${DASHBOARD_URL}/health. Recent logs:"
-	docker logs --tail 80 flow-sweep-bot 2>/dev/null || true
+	docker logs --tail 80 oi-5morb-bot 2>/dev/null || true
 	return 1
 }
 
@@ -78,10 +78,10 @@ echo "Using Docker config: $DOCKER_CONFIG"
 echo "Using Docker BuildKit: $DOCKER_BUILDKIT"
 stop_local_bot_containers
 free_dashboard_port
-echo "Building flow-sweep-bot image..."
-docker build -t flow-sweep-bot .
-echo "Starting flow-sweep-bot detached. Dashboard: ${DASHBOARD_URL}"
-docker run -d --name flow-sweep-bot \
+echo "Building oi-5morb-bot image..."
+docker build -t oi-5morb-bot .
+echo "Starting oi-5morb-bot detached. Dashboard: ${DASHBOARD_URL}"
+docker run -d --name oi-5morb-bot \
 	--env-file .env \
 	-e AWS_PROFILE="${AWS_PROFILE:-trading_bot}" \
 	-e AWS_REGION="${AWS_REGION:-us-east-2}" \
@@ -90,13 +90,13 @@ docker run -d --name flow-sweep-bot \
 	-p "${DASHBOARD_PORT}:${DASHBOARD_PORT}" \
 	-v "$HOME/.aws:/root/.aws:ro" \
 	-v "$(pwd)/runtime:/app/runtime" \
-	flow-sweep-bot >/dev/null
+	oi-5morb-bot >/dev/null
 
 wait_for_dashboard
 
-echo "View logs: docker logs -f flow-sweep-bot"
-echo "Stop bot:  docker rm -f flow-sweep-bot"
+echo "View logs: docker logs -f oi-5morb-bot"
+echo "Stop bot:  docker rm -f oi-5morb-bot"
 
 if [[ "$FOLLOW_LOGS" == "1" ]]; then
-	docker logs -f flow-sweep-bot
+	docker logs -f oi-5morb-bot
 fi

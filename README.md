@@ -1,4 +1,4 @@
-# Flow Sweep Options Trading Bot
+# OI 5mORB Options Trading Bot
 
 An automated options trading bot built with Python and `alpaca-py`. It reads prior-session scored options flow from `uw-hub` DynamoDB data, builds a bullish or bearish watchlist, then waits for 5-minute reclaim/rejection setups around important market levels.
 
@@ -50,7 +50,7 @@ Contracts are selected from the nearest active expiration, including 0DTE when a
 - Target is bot-managed. The bot uses the closest opposing key level only when that level offers at least 2R from the underlying entry-to-stop distance; otherwise it uses a fixed 2R underlying target so trades can still run into all-time highs or lows.
 - Before the underlying reaches 1.5R, the bot now arms an option-price floor after a 15% premium gain, exits on a 30% option premium loss, and cuts no-progress trades after 90 minutes when the option is not green.
 - Once the underlying reaches 1.5R, the bot attempts to sell 50% of the position when there are enough contracts to leave a runner, then switches the remaining position to option breakeven and exits if the option market price falls back to the entry option price.
-- Once daily account equity reaches a 2% high-water gain, the bot blocks new entries and flattens managed Flow Sweep positions if equity gives back to the configured daily profit-lock floor.
+- Once daily account equity reaches a 2% high-water gain, the bot blocks new entries and flattens managed OI 5mORB positions if equity gives back to the configured daily profit-lock floor.
 - Remaining positions are closed near end of day at 15:55 ET.
 - Local runtime state is persisted under `runtime/state.json` so open option positions can be reconciled after restart.
 
@@ -125,16 +125,16 @@ The Docker launcher mounts `$HOME/.aws` read-only so the container can use the l
 
 ## Code Layout
 
-The runtime entrypoint is intentionally small: `main.py` delegates to the `flow_sweep` package.
+The runtime entrypoint is intentionally small: `main.py` delegates to the `oi_5morb` package.
 
-- `flow_sweep/config.py`: environment, constants, logging, runtime paths.
-- `flow_sweep/clients.py`: Alpaca, DynamoDB, and NYSE calendar clients.
-- `flow_sweep/state.py`: runtime state, persistence, and locks.
-- `flow_sweep/market_data.py`: Alpaca/Yahoo market data and key level helpers.
-- `flow_sweep/flow_data.py`: `uw-hub` DynamoDB reads and flow-bias scoring.
-- `flow_sweep/strategy.py`: setup preparation, entries, exits, streams, reconciliation.
-- `flow_sweep/dashboard.py`: local dashboard and `/api/status` endpoint.
-- `flow_sweep/app.py`: CLI orchestration for live mode and smoke tests.
+- `oi_5morb/config.py`: environment, constants, logging, runtime paths.
+- `oi_5morb/clients.py`: Alpaca, DynamoDB, and NYSE calendar clients.
+- `oi_5morb/state.py`: runtime state, persistence, and locks.
+- `oi_5morb/market_data.py`: Alpaca/Yahoo market data and key level helpers.
+- `oi_5morb/flow_data.py`: `uw-hub` DynamoDB reads and flow-bias scoring.
+- `oi_5morb/strategy.py`: setup preparation, entries, exits, streams, reconciliation.
+- `oi_5morb/dashboard.py`: local dashboard and `/api/status` endpoint.
+- `oi_5morb/app.py`: CLI orchestration for live mode and smoke tests.
 
 ## Dashboard
 
@@ -181,7 +181,7 @@ Before startup, `setup.sh` stops older local bot containers and tries to kill an
 The script starts the container detached, waits for the dashboard health endpoint, then exits back to your shell. To watch the live bot logs after startup:
 
 ```bash
-docker logs -f flow-sweep-bot
+docker logs -f oi-5morb-bot
 ```
 
 Or run startup and immediately follow logs:
@@ -207,7 +207,7 @@ This checks the live Alpaca account, clock, contract chain, snapshots, liquidity
 Historical backtest using UW scored-flow rows and underlying price data:
 
 ```bash
-python3 scripts/backtest_flow_sweep.py --sessions 40
+python3 scripts/backtest_oi_5morb.py --sessions 40
 ```
 
 The backtest writes markdown and CSV logs to `runtime/backtests/`. It measures the strategy in underlying R multiples and approximates the breakeven stop as an underlying entry-price stop because historical option bid/ask replay is not included.
@@ -215,7 +215,7 @@ The backtest writes markdown and CSV logs to `runtime/backtests/`. It measures t
 Docker smoke test after building the image:
 
 ```bash
-docker run --rm --env-file .env --entrypoint python flow-sweep-bot main.py --smoke-test
+docker run --rm --env-file .env --entrypoint python oi-5morb-bot main.py --smoke-test
 ```
 
 Manual Docker run:
@@ -224,10 +224,10 @@ Manual Docker run:
 export DOCKER_CONFIG="${DOCKER_CONFIG:-$(pwd)/runtime/docker-config}"
 mkdir -p "$DOCKER_CONFIG"
 test -f "$DOCKER_CONFIG/config.json" || printf '{}\n' > "$DOCKER_CONFIG/config.json"
-docker build -t flow-sweep-bot .
+docker build -t oi-5morb-bot .
 mkdir -p runtime
-docker rm -f flow-sweep-bot 2>/dev/null || true
-docker run --rm --name flow-sweep-bot \
+docker rm -f oi-5morb-bot 2>/dev/null || true
+docker run --rm --name oi-5morb-bot \
   --env-file .env \
   -e AWS_PROFILE="${AWS_PROFILE:-trading_bot}" \
   -e AWS_REGION="${AWS_REGION:-us-east-2}" \
@@ -236,7 +236,7 @@ docker run --rm --name flow-sweep-bot \
   -p "${BOT_DASHBOARD_PORT:-8765}:${BOT_DASHBOARD_PORT:-8765}" \
   -v "$HOME/.aws:/root/.aws:ro" \
   -v "$(pwd)/runtime:/app/runtime" \
-  flow-sweep-bot
+  oi-5morb-bot
 ```
 
 ## Disclaimer

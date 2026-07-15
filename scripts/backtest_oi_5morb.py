@@ -12,7 +12,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from flow_sweep.config import (  # noqa: E402
+from oi_5morb.config import (  # noqa: E402
     BREAKEVEN_TRIGGER_R_MULTIPLE,
     CONSENSUS_THRESHOLD,
     ENABLE_CONTINUATION_FVG,
@@ -36,9 +36,9 @@ from flow_sweep.config import (  # noqa: E402
     UTC,
     configure_logging,
 )
-from flow_sweep.flow_data import query_flow_scores, summarize_flow_rows  # noqa: E402
-from flow_sweep.market_data import daily_bars, get_schedule, intraday_bars, previous_calendar_week_sessions  # noqa: E402
-from flow_sweep.strategy import (  # noqa: E402
+from oi_5morb.flow_data import query_flow_scores, summarize_flow_rows  # noqa: E402
+from oi_5morb.market_data import daily_bars, get_schedule, intraday_bars, previous_calendar_week_sessions  # noqa: E402
+from oi_5morb.strategy import (  # noqa: E402
     apply_level_roles,
     age_active_continuation_zone,
     build_continuation_zone,
@@ -57,7 +57,7 @@ from flow_sweep.strategy import (  # noqa: E402
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Backtest the Flow Sweep entry/exit logic with UW flow and underlying price data.")
+    parser = argparse.ArgumentParser(description="Backtest the OI 5mORB entry/exit logic with UW flow and underlying price data.")
     parser.add_argument("--sessions", type=int, default=20, help="Number of completed NYSE sessions to test.")
     parser.add_argument("--end-date", help="Last session date to include, YYYY-MM-DD. Defaults to latest completed session.")
     parser.add_argument("--symbols", help="Comma-separated symbol list. Defaults to the bot watchlist.")
@@ -453,7 +453,7 @@ def backtest_symbol(symbol, schedule, session_indices):
                         {
                             **base,
                             "status": "SKIPPED",
-                            "setup_type": "flow_sweep",
+                            "setup_type": "oi_5morb",
                             "reason": f"Confirmation failed: {confirmation_reason}",
                             "sweep_signal_time": sweep_bar["close_time"].isoformat(),
                             "entry_time": signal_bar["close_time"].isoformat(),
@@ -490,7 +490,7 @@ def backtest_symbol(symbol, schedule, session_indices):
                 candidates.sort(
                     key=lambda item: (
                         item["armed_at"].isoformat() if hasattr(item.get("armed_at"), "isoformat") else "9999-12-31T23:59:59+00:00",
-                        item["metadata"].get("setup_type") != "flow_sweep",
+                        item["metadata"].get("setup_type") != "oi_5morb",
                     )
                 )
                 option_type = "CALL" if bias.direction == "bullish" else "PUT"
@@ -668,8 +668,8 @@ def fmt_number(value):
 def write_outputs(rows, output_dir, started_at, sessions, symbols):
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = started_at.strftime("%Y%m%d_%H%M%S")
-    csv_path = output_dir / f"flow_sweep_backtest_{stamp}.csv"
-    md_path = output_dir / f"flow_sweep_backtest_{stamp}.md"
+    csv_path = output_dir / f"oi_5morb_backtest_{stamp}.csv"
+    md_path = output_dir / f"oi_5morb_backtest_{stamp}.md"
 
     fieldnames = sorted({key for row in rows for key in row.keys()})
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
@@ -688,7 +688,7 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         entry_model_line = "- Entry can come from either the confirmed level-sweep model or the continuation FVG model, with the earliest armed valid setup winning for that symbol."
 
     lines = [
-        "# Flow Sweep Backtest",
+        "# OI 5mORB Backtest",
         "",
         f"Generated: {started_at.astimezone(ET).isoformat()}",
         f"Sessions: {sessions[0].isoformat()} through {sessions[-1].isoformat()} ({len(sessions)} sessions)",
@@ -748,7 +748,7 @@ def write_outputs(rows, output_dir, started_at, sessions, symbols):
         exit_text = f"{str(row.get('exit_time') or '')[-14:-6]} {row.get('exit_reason')} @ {row.get('exit_price')}"
         target = f"{row.get('target_name')} {row.get('target_price')} ({row.get('target_r')}R)"
         lines.append(
-            f"| {row['session']} | {row['symbol']} | {row.get('setup_type', 'flow_sweep')} | {row.get('direction')} {row.get('option_type')} | {entry} | {exit_text} | {row.get('r_multiple'):.2f} | {target} | {row.get('flow_rows')} |"
+            f"| {row['session']} | {row['symbol']} | {row.get('setup_type', 'oi_5morb')} | {row.get('direction')} {row.get('option_type')} | {entry} | {exit_text} | {row.get('r_multiple'):.2f} | {target} | {row.get('flow_rows')} |"
         )
 
     lines.extend(

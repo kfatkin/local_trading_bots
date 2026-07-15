@@ -2,7 +2,7 @@ import argparse
 import threading
 
 from .clients import stock_stream
-from .config import LOGGER, configure_logging, validate_configuration
+from .config import LOGGER, SYMBOLS, configure_logging, validate_configuration
 from .dashboard import dashboard_status_payload, start_dashboard_thread
 from .option_selection import validate_entry_contract
 from .state import load_state_from_disk
@@ -73,7 +73,11 @@ def run_live():
     payload = dashboard_status_payload()
     symbols = sorted({decision.get("symbol") for decision in payload.get("decisions", []) if decision.get("symbol")})
     if not symbols:
-        raise RuntimeError("Morning watchlist returned no symbols to subscribe")
+        symbols = sorted(SYMBOLS)
+        LOGGER.warning(
+            "Morning watchlist returned no symbols; falling back to configured symbol universe (%s symbols)",
+            len(symbols),
+        )
     trading_thread = threading.Thread(target=start_trading_stream, name="alpaca-trading-stream", daemon=True)
     trading_thread.start()
     LOGGER.info("Subscribing to %s watchlist symbols for 1m ORB tracking", len(symbols))

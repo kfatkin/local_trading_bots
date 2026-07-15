@@ -46,6 +46,7 @@ UW_API_KEY = (os.getenv("UW_API_KEY") or os.getenv("UNUSUAL_WHALES_API_KEY") or 
 OI_CHANGE_SECRET_NAME = os.getenv("OI_CHANGE_SECRET_NAME", "fatty-trades/api-keys").strip()
 OI_CHANGE_AWS_PROFILE = os.getenv("OI_CHANGE_AWS_PROFILE", "personal").strip()
 OI_CHANGE_AWS_REGION = os.getenv("OI_CHANGE_AWS_REGION", AWS_REGION).strip()
+OI_CHANGE_API_URL = os.getenv("OI_CHANGE_API_URL", "https://api.unusualwhales.com/api/market/oi-change").strip()
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex" if PAPER else "sip").strip() or None
 DASHBOARD_ENABLED = env_flag("BOT_DASHBOARD_ENABLED", True)
 DASHBOARD_HOST = os.getenv("BOT_DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -53,7 +54,7 @@ DASHBOARD_PORT = env_int("BOT_DASHBOARD_PORT", 8765)
 
 RUNTIME_DIR = Path(os.getenv("BOT_RUNTIME_DIR", str(PROJECT_DIR / "runtime")))
 STATE_FILE_PATH = RUNTIME_DIR / "state.json"
-LOG_FILE_PATH = RUNTIME_DIR / "flow-sweep-bot.log"
+LOG_FILE_PATH = RUNTIME_DIR / "oi-5morb-bot.log"
 
 CLIENT_ORDER_PREFIX = os.getenv("CLIENT_ORDER_PREFIX", "fsw")
 SYMBOLS = [
@@ -135,7 +136,7 @@ ENTRY_WINDOW_START = dt_time(9, 35)
 ENTRY_WINDOW_END = dt_time(14, 0)
 EOD_EXIT_TIME = dt_time(15, 55)
 
-LOGGER = logging.getLogger("flow_sweep_bot")
+LOGGER = logging.getLogger("oi_5morb_bot")
 
 
 def ensure_runtime_dir():
