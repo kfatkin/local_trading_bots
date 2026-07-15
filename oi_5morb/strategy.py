@@ -1936,6 +1936,17 @@ def flatten_for_daily_profit_lock():
         execute_exit(symbol, qty, "DAILY_PROFIT_LOCK")
 
 
+def flatten_for_time_cutoff(reason="TIME_CUTOFF_1300"):
+    with STATE_LOCK:
+        positions = [
+            (symbol, to_int_qty(position.get("total_qty", 0)))
+            for symbol, position in active_positions.items()
+            if position.get("managed", True) and to_int_qty(position.get("total_qty", 0)) > 0
+        ]
+    for symbol, qty in positions:
+        execute_exit(symbol, qty, reason)
+
+
 def manage_open_position_with_bar(symbol, minute_bar):
     with STATE_LOCK:
         position = active_positions.get(symbol)
@@ -2019,6 +2030,9 @@ async def handle_bar(bar):
     timestamp_et = bar_timestamp_et(bar)
     prepare_daily_context(timestamp_et)
     refresh_daily_profit_lock(timestamp_et, flatten_on_trigger=True)
+    if timestamp_et.time() >= EOD_EXIT_TIME:
+        flatten_for_time_cutoff()
+        return
     if daily_profit_lock_triggered():
         return
 
