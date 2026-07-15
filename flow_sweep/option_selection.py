@@ -100,7 +100,7 @@ def empty_contract_preview(symbol, option_type=None, status="not_planned", reaso
     return preview
 
 
-def fetch_active_contracts(symbol, option_type):
+def fetch_active_contracts(symbol, option_type, expiration=None):
     today = datetime.now(ET).date()
     expiration_lte = today + timedelta(days=OPTION_EXPIRATION_LOOKAHEAD_DAYS)
     contract_type = option_type_enum(option_type)
@@ -112,8 +112,8 @@ def fetch_active_contracts(symbol, option_type):
             underlying_symbols=[symbol],
             status=AssetStatus.ACTIVE,
             type=contract_type,
-            expiration_date_gte=today,
-            expiration_date_lte=expiration_lte,
+            expiration_date_gte=expiration or today,
+            expiration_date_lte=expiration or expiration_lte,
             limit=1000,
             page_token=page_token,
         )
@@ -353,12 +353,14 @@ def apply_liquidity_checks(candidate):
     return candidate
 
 
-def liquidity_rank(candidate):
+def liquidity_rank(candidate, anchor_strike=None):
     spread_pct = candidate.get("spread_pct") if candidate.get("spread_pct") is not None else math.inf
     volume = candidate.get("volume") or 0
     open_interest = candidate.get("open_interest") or 0
+    strike_distance = abs(float(candidate.get("strike") or 0.0) - float(anchor_strike)) if anchor_strike not in (None, "") else math.inf
     return (
         0 if candidate.get("liquidity_pass") else 1,
+        strike_distance,
         spread_pct,
         -volume,
         -open_interest,
@@ -385,8 +387,20 @@ def summarize_candidate(candidate):
     return {key: candidate.get(key) for key in keys}
 
 
-def best_contract_candidate(symbol, option_type):
-    contracts = fetch_active_contracts(symbol, option_type)
+def best_contract_candidate(symbol, option_type, contract_plan=None):
+    contract_plan = contract_plan or {}
+    expiration = contract_plan.get("expiration")
+    if isinstance(expiration, str) and expiration:
+        expiration = datetime.fromisoformat(expiration).date()
+    else:
+        expiration = None
+
+    min_price = optional_float(contract_plan.get("min_price"))
+    max_price = optional_float(contract_plan.get("max_price"))
+    anchor_strike = optional_float(contract_plan.get("strike"))
+    exact_symbol = normalize_text(contract_plan.get("option_symbol")) or None
+
+    contracts = fetch_active_contracts(symbol, option_type, expiration=expiration)
     if not contracts:
         return None, [], "No active option contracts found"
 
@@ -410,6 +424,25 @@ def best_contract_candidate(symbol, option_type):
         if not candidates:
             continue
 
+        if exact_symbol:
+            exact_candidates = [candidate for candidate in candidates if normalize_text(candidate.get("symbol")) == exact_symbol]
+            if exact_candidates:
+                candidates = exact_candidates + [candidate for candidate in candidates if candidate not in exact_candidates]
+
+        if min_price is not None or max_price is not None:
+            priced = []
+            for candidate in candidates:
+                ask_price = candidate.get("ask")
+                if ask_price is None:
+                    continue
+                if min_price is not None and ask_price < min_price:
+                    continue
+                if max_price is not None and ask_price > max_price:
+                    continue
+                priced.append(candidate)
+            if priced:
+                candidates = priced
+
         band = candidate_delta_band(candidates)
         missing_volume_symbols = [candidate["symbol"] for candidate in band if candidate.get("volume") is None]
         volumes = fetch_recent_option_volumes(missing_volume_symbols)
@@ -418,8 +451,12 @@ def best_contract_candidate(symbol, option_type):
             candidate.update(volumes.get(candidate["symbol"], {}))
             enriched.append(apply_liquidity_checks(candidate))
 
-        selected = min(enriched, key=liquidity_rank)
+        selected = min(enriched, key=lambda candidate: liquidity_rank(candidate, anchor_strike=anchor_strike))
         reason = "Selected from nearest expiration candidate band"
+        if expiration:
+            reason = f"Selected from planned expiration {expiration.isoformat()}"
+        if min_price is not None or max_price is not None:
+            reason += f" within ${min_price if min_price is not None else 0:.2f}-${max_price if max_price is not None else 9999:.2f}"
         if not selected.get("liquidity_pass"):
             reason = "Selected best available contract, but liquidity filters did not all pass"
         return selected, sorted(enriched, key=lambda candidate: candidate["delta_distance"]), reason
@@ -531,10 +568,10 @@ def validate_entry_contract(contract_preview, require_market_open=True):
     }
 
 
-def build_contract_preview(symbol, option_type, account=None):
+def build_contract_preview(symbol, option_type, account=None, contract_plan=None):
     account = account or account_balance_summary()
     try:
-        selected, candidates, reason = best_contract_candidate(symbol, option_type)
+        selected, candidates, reason = best_contract_candidate(symbol, option_type, contract_plan=contract_plan)
     except Exception as exc:
         LOGGER.warning("Contract preview failed for %s %s: %s", symbol, option_type, exc)
         return empty_contract_preview(symbol, option_type, status="error", reason=f"Contract preview failed: {exc}", account=account)

@@ -2,7 +2,7 @@ import argparse
 import threading
 
 from .clients import stock_stream
-from .config import LOGGER, SYMBOLS, configure_logging, validate_configuration
+from .config import LOGGER, configure_logging, validate_configuration
 from .dashboard import dashboard_status_payload, start_dashboard_thread
 from .option_selection import validate_entry_contract
 from .state import load_state_from_disk
@@ -70,14 +70,19 @@ def run_live():
     reconcile_state()
     start_dashboard_thread()
     prepare_daily_context(force=True)
+    payload = dashboard_status_payload()
+    symbols = sorted({decision.get("symbol") for decision in payload.get("decisions", []) if decision.get("symbol")})
+    if not symbols:
+        raise RuntimeError("Morning watchlist returned no symbols to subscribe")
     trading_thread = threading.Thread(target=start_trading_stream, name="alpaca-trading-stream", daemon=True)
     trading_thread.start()
-    stock_stream.subscribe_bars(handle_bar, *SYMBOLS)
+    LOGGER.info("Subscribing to %s watchlist symbols for 1m ORB tracking", len(symbols))
+    stock_stream.subscribe_bars(handle_bar, *symbols)
     stock_stream.run()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Run the Flow Sweep options bot.")
+    parser = argparse.ArgumentParser(description="Run the morning OI opening-range-breakout options bot.")
     parser.add_argument("--smoke-test", action="store_true", help="Start config/dashboard checks only; do not open streams or submit orders.")
     parser.add_argument("--entry-preflight", action="store_true", help="Validate current Alpaca option contract selection without submitting orders.")
     args = parser.parse_args(argv)

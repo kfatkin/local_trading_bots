@@ -35,6 +35,7 @@ from .config import (
     PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT,
     PRE_BREAKEVEN_OPTION_LOCK_ENABLED,
     PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT,
+    REGULAR_OPEN,
     RUNTIME_DIR,
     RUNNER_EXTENSION_R_MULTIPLE,
     RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE,
@@ -43,7 +44,6 @@ from .config import (
     RUNNER_STALL_R_MULTIPLE,
     SECOND_PARTIAL_EXIT_PCT,
     SECOND_PARTIAL_EXIT_R_MULTIPLE,
-    SYMBOLS,
     TARGET_DELTA,
     TRADE_ALLOCATION_PCT,
 )
@@ -254,6 +254,12 @@ def position_payload(symbol, position, broker_position=None):
         "latest_option_bid": round_or_none(position.get("latest_option_bid"), 4),
         "latest_option_ask": round_or_none(position.get("latest_option_ask"), 4),
         "latest_option_quote_time": position.get("latest_option_quote_time"),
+        "opening_range_high": round_or_none(position.get("opening_range_high")),
+        "opening_range_low": round_or_none(position.get("opening_range_low")),
+        "profit_lock_pct": round_or_none(position.get("profit_lock_pct"), 4),
+        "profit_lock_option_price": round_or_none(position.get("profit_lock_option_price"), 4),
+        "latest_option_gain_pct": round_or_none(position.get("latest_option_gain_pct"), 4),
+        "range_reentry_close_count": position.get("range_reentry_close_count"),
         "broker": broker_payload,
     }
 
@@ -279,6 +285,72 @@ def completed_bar_payload(symbol, bar):
         "close": round_or_none(bar.get("close")),
         "volume": round_or_none(bar.get("volume"), 0),
     }
+
+
+def closed_positions_payload(events):
+    positions = {}
+    for event in events or []:
+        symbol = event.get("symbol")
+        if not symbol or symbol == "*":
+            continue
+        record = positions.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "option_symbol": event.get("option_symbol"),
+                "option_type": event.get("option_type"),
+                "setup_type": event.get("setup_type"),
+                "entry_qty": 0,
+                "entry_notional": 0.0,
+                "exit_qty": 0,
+                "exit_notional": 0.0,
+                "entry_time": None,
+                "exit_time": None,
+                "close_reason": None,
+            },
+        )
+        if event.get("option_symbol"):
+            record["option_symbol"] = event.get("option_symbol")
+        if event.get("option_type"):
+            record["option_type"] = event.get("option_type")
+        if event.get("setup_type"):
+            record["setup_type"] = event.get("setup_type")
+
+        event_type = event.get("event_type")
+        qty = to_int_qty(event.get("qty") or event.get("filled_qty") or 0)
+        price = get_value(event, "filled_avg_price", event.get("ask"))
+        price = float(price) if price not in (None, "") else None
+        if event_type == "entry_fill" and qty > 0 and price is not None:
+            record["entry_qty"] += qty
+            record["entry_notional"] += qty * price * 100.0
+            record["entry_time"] = event.get("timestamp")
+        elif event_type == "exit_fill" and qty > 0 and price is not None:
+            record["exit_qty"] += qty
+            record["exit_notional"] += qty * price * 100.0
+            record["exit_time"] = event.get("timestamp")
+            record["close_reason"] = event.get("reason") or record.get("close_reason")
+
+    closed = []
+    for record in positions.values():
+        if record["entry_qty"] <= 0 or record["exit_qty"] < record["entry_qty"]:
+            continue
+        cost_basis = record["entry_notional"]
+        proceeds = record["exit_notional"]
+        realized_pl = proceeds - cost_basis
+        realized_plpc = (realized_pl / cost_basis) if cost_basis else None
+        closed.append(
+            {
+                **record,
+                "avg_entry_price": round(record["entry_notional"] / (record["entry_qty"] * 100.0), 4) if record["entry_qty"] else None,
+                "avg_exit_price": round(record["exit_notional"] / (record["exit_qty"] * 100.0), 4) if record["exit_qty"] else None,
+                "cost_basis": round(cost_basis, 2),
+                "proceeds": round(proceeds, 2),
+                "realized_pl": round(realized_pl, 2),
+                "realized_plpc": round(realized_plpc, 4) if realized_plpc is not None else None,
+            }
+        )
+    closed.sort(key=lambda row: row.get("exit_time") or "", reverse=True)
+    return closed
 
 
 def latest_backtest_payload():
@@ -330,9 +402,17 @@ def latest_backtest_payload():
 
 def dashboard_status_payload():
     try:
-        from .strategy import refresh_contract_previews_if_needed
+        from .strategy import prepare_daily_context, refresh_contract_previews_if_needed
 
-        refresh_contract_previews_if_needed(reason="dashboard")
+        now_et = datetime.now(ET)
+        prepare_daily_context(now_et=now_et)
+        with CONTEXT_LOCK:
+            force_refresh = now_et.time() >= REGULAR_OPEN and any(
+                decision.get("status") in {"orb_wait", "ready"}
+                and not (decision.get("contract_preview") or {}).get("symbol")
+                for decision in (daily_context.get("decisions") or {}).values()
+            )
+        refresh_contract_previews_if_needed(force=force_refresh, reason="dashboard")
     except Exception as exc:
         LOGGER.warning("Unable to refresh contract previews for dashboard: %s", exc)
 
@@ -371,17 +451,24 @@ def dashboard_status_payload():
         pending_exits = [pending_exit_payload(order_id, state.copy()) for order_id, state in pending_exit_orders.items()]
         daily_trades = dict(daily_trade_state)
         daily_trades["events"] = list(daily_trade_state.get("events", []))
+        closed_positions = closed_positions_payload(daily_trades["events"])
 
     with CONTEXT_LOCK:
         decisions_by_symbol = dict(daily_context.get("decisions") or {})
-        decisions = [decisions_by_symbol.get(symbol, default_decision(symbol)) for symbol in SYMBOLS]
+        decisions = sorted(decisions_by_symbol.values(), key=lambda decision: (decision.get("symbol") or "", decision.get("status") or ""))
         recent_bars = [completed_bar_payload(symbol, bar.copy()) for symbol, bar in last_completed_bars.items()]
+        staged_count = sum(1 for decision in decisions if decision.get("status") == "staged")
+        planned_count = sum(1 for decision in decisions if (decision.get("contract_preview") or {}).get("symbol"))
+        orb_ready_count = sum(1 for decision in decisions if decision.get("status") == "ready")
         context = {
             "session": daily_context.get("session"),
             "prior_session": daily_context.get("prior_session"),
             "prepared": bool(daily_context.get("prepared")),
             "prepared_at": daily_context.get("prepared_at"),
             "ready_count": sum(1 for decision in decisions if decision.get("status") == "ready"),
+            "staged_count": staged_count,
+            "planned_count": planned_count,
+            "orb_ready_count": orb_ready_count,
             "high_score_flow_count": sum(len(decision.get("flow_rows", [])) for decision in decisions),
             "last_attempt_seconds_ago": round(time.monotonic() - daily_context.get("last_attempt_monotonic", 0.0), 1),
             "account": daily_context.get("account") or {},
@@ -391,9 +478,9 @@ def dashboard_status_payload():
 
     return {
         "bot": {
-            "name": "Flow Sweep Bot",
+            "name": "Morning OI ORB Bot",
             "paper": PAPER,
-            "symbols": SYMBOLS,
+            "symbols": [decision.get("symbol") for decision in decisions if decision.get("symbol")],
             "min_flow_score": MIN_FLOW_SCORE,
             "consensus_threshold": CONSENSUS_THRESHOLD,
             "trade_allocation_pct": TRADE_ALLOCATION_PCT,
@@ -435,6 +522,7 @@ def dashboard_status_payload():
         "pending_entry_orders": pending_entries,
         "pending_exit_orders": pending_exits,
         "recent_5m_bars": sorted(recent_bars, key=lambda item: item.get("symbol") or ""),
+        "closed_positions": closed_positions,
     }
 
 
@@ -443,7 +531,7 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Flow Sweep Bot</title>
+    <title>Morning OI ORB Bot</title>
     <style>
         :root {
             color-scheme: light dark;
@@ -526,7 +614,7 @@ DASHBOARD_HTML = """<!doctype html>
         .bearish { color: var(--bear); font-weight: 700; }
         .neutral { color: var(--muted); font-weight: 700; }
         .status-ready { color: var(--ready); font-weight: 700; }
-        .status-flow_preview { color: var(--warn); font-weight: 700; }
+        .status-staged, .status-orb_wait { color: var(--warn); font-weight: 700; }
         .status-skipped, .status-pending { color: var(--skip); font-weight: 700; }
         .status-error, .status-unavailable, .status-too_expensive { color: var(--warn); font-weight: 700; }
         .levels { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -580,7 +668,7 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
     <header>
         <div class="header-row">
-            <h1>Flow Sweep Bot</h1>
+            <h1>Morning OI ORB Bot</h1>
             <div class="toolbar">
                 <button class="toolbar-button" id="backtest-button" type="button" onclick="toggleBacktest()">Backtest</button>
             </div>
@@ -604,6 +692,10 @@ DASHBOARD_HTML = """<!doctype html>
         <section>
             <h2 class="section-title">Active Positions</h2>
             <div class="wide"><table id="positions"></table></div>
+        </section>
+        <section>
+            <h2 class="section-title">Closed Positions</h2>
+            <div class="wide"><table id="closed-positions"></table></div>
         </section>
         <section>
             <h2 class="section-title">Broker Open Orders</h2>
@@ -644,6 +736,12 @@ DASHBOARD_HTML = """<!doctype html>
             if (amount < 0) return 'pnl-negative';
             return 'muted';
         }
+        function decisionStatusText(status) {
+            if (status === 'staged') return 'staged';
+            if (status === 'orb_wait') return 'planned';
+            if (status === 'ready') return 'entry level set';
+            return status || '-';
+        }
         function brokerPnl(position) {
             const broker = position.broker;
             if (!broker) return '<span class="muted">No Alpaca position</span>';
@@ -656,6 +754,16 @@ DASHBOARD_HTML = """<!doctype html>
             return `${option}<br><span class="muted">Avg ${premium(broker.avg_entry_price)} / Mark ${premium(broker.current_price)}</span>`;
         }
         function stopPlan(position) {
+            if (position.setup_type === 'opening_range_breakout') {
+                const rangeText = position.opening_range_low == null || position.opening_range_high == null
+                    ? '-'
+                    : `${px(position.opening_range_low)}-${px(position.opening_range_high)}`;
+                const lockText = position.profit_lock_pct == null
+                    ? 'Not armed'
+                    : `${pct(position.profit_lock_pct)} / stop ${premium(position.profit_lock_option_price)}`;
+                const count = position.range_reentry_close_count == null ? '-' : `${position.range_reentry_close_count} / 3`;
+                return `<div class="plan-line"><strong>3 closes back inside ${esc(rangeText)}</strong></div><div class="muted">Option trail ${esc(lockText)}</div><div class="muted">Range re-entry count ${esc(count)}</div>`;
+            }
             const active = position.breakeven_active;
             const stopLine = active ? `BE option ${premium(position.breakeven_stop_option_price)}` : `Underlying ${px(position.stop_underlying)}`;
             const trigger = position.breakeven_trigger_underlying == null ? '-' : `${px(position.breakeven_trigger_underlying)} (${fixed(position.breakeven_trigger_r_multiple || 1.5, 1)}R)`;
@@ -664,6 +772,9 @@ DASHBOARD_HTML = """<!doctype html>
             return `<div class="plan-line"><strong>${esc(stopLine)}</strong></div><div class="muted">Initial ${px(position.initial_stop_underlying || position.stop_underlying)} / BE trigger ${trigger}</div><div class="muted">Partial ${partial} / ${esc(partialState)}</div>`;
         }
         function targetPlan(position) {
+            if (position.setup_type === 'opening_range_breakout') {
+                return `<div class="plan-line"><strong>+100% option gain</strong></div><div class="muted">Move to B/E at +25%, then lock another +25% for each +25% gain</div>`;
+            }
             const target = position.target_underlying == null ? '-' : `${px(position.target_underlying)}${position.target_name ? ` (${esc(position.target_name)})` : ''}`;
             return `<div class="plan-line"><strong>${target}</strong></div><div class="muted">${fixed(position.target_r_multiple, 2)}R / ${esc(position.target_exit_method || 'bot-managed')}</div>`;
         }
@@ -718,6 +829,17 @@ DASHBOARD_HTML = """<!doctype html>
         function levels(items) {
             if (!items || !items.length) return '<span class="muted">none</span>';
             return `<div class="levels">${items.map(item => `<span class="level">${esc(item.name)} ${px(item.price)}</span>`).join('')}</div>`;
+        }
+        function entryLevel(decision) {
+            const items = decision.trigger_levels || [];
+            if (!items.length) {
+                if (decision.status === 'staged') return '<span class="muted">Waiting for market open contract plan</span>';
+                if (decision.status === 'orb_wait') return '<span class="muted">Waiting for 5m ORB range</span>';
+                return '<span class="muted">pending</span>';
+            }
+            const item = items[0];
+            const action = decision.option_type === 'CALL' ? 'Break above' : 'Break below';
+            return `<div class="plan-line"><strong>${esc(action)} ${px(item.price)}</strong></div><div class="muted">${esc(item.label || item.name)}</div>`;
         }
         function keyLevelAction(level) {
             if (level.status === 'pending') return 'Pending premarket';
@@ -795,7 +917,7 @@ DASHBOARD_HTML = """<!doctype html>
         function flowDetails(decision) {
             const rows = decision.flow_rows || [];
             if (!rows.length) {
-                return `<tr class="flow-detail-row"><td></td><td colspan="6"><span class="muted">No >70 flow rows from the prior session.</span></td></tr>`;
+                return `<tr class="flow-detail-row"><td></td><td colspan="6"><span class="muted">No qualifying morning OI contracts.</span></td></tr>`;
             }
             const openAttr = expandedFlowSymbols.has(decision.symbol) ? ' open' : '';
             const body = rows.map(row => {
@@ -814,7 +936,7 @@ DASHBOARD_HTML = """<!doctype html>
             }).join('');
             return `<tr class="flow-detail-row"><td></td><td colspan="6">
                 <details class="flow-details" data-symbol="${esc(decision.symbol)}" ontoggle="toggleFlowDetail(this)"${openAttr}>
-                    <summary>${esc(decision.symbol)} high-score flow from prior session (${rows.length})</summary>
+                    <summary>${esc(decision.symbol)} qualifying morning OI contracts (${rows.length})</summary>
                     <table class="flow-table">
                         <thead><tr><th>Time</th><th>Score</th><th>Bias</th><th>Premium</th><th>Spot</th><th>Contract</th><th>Flags</th><th>Reasons</th></tr></thead>
                         <tbody>${body}</tbody>
@@ -906,8 +1028,12 @@ DASHBOARD_HTML = """<!doctype html>
             ].map(item => `<span class="pill">${item}</span>`).join('');
             document.getElementById('metrics').innerHTML = [
                 metric('Ready Setups', ready),
+                metric('Staged Tickers', data.daily_context.staged_count || 0),
+                metric('Contracts Planned', data.daily_context.planned_count || 0),
+                metric('ORB Entry Levels', data.daily_context.orb_ready_count || 0),
                 metric('High-Score Flow Rows', data.daily_context.high_score_flow_count || 0),
                 metric('Active Positions', data.active_positions.length),
+                metric('Closed Positions', (data.closed_positions || []).length),
                 metric('Pending Orders', data.pending_entry_orders.length + data.pending_exit_orders.length),
                 metric('Broker Orders', data.broker_open_orders.length),
                 metric('Account Balance', usd(data.daily_context.account && data.daily_context.account.account_balance)),
@@ -917,15 +1043,15 @@ DASHBOARD_HTML = """<!doctype html>
                 metric('Trade Events', (data.daily_trade_state.events || []).length)
             ].join('');
             table('alpaca', ['Area', 'Status', 'Details'], alpacaStatusRows(data), 'Alpaca account and clock details unavailable.');
-            table('decisions', ['Symbol', 'Decision', 'Consensus', 'Key Levels', 'Planned Contract', 'Targets', 'Reason'], data.decisions.flatMap(d => {
+            table('decisions', ['Symbol', 'Decision', 'Consensus', 'Key Levels', 'Planned Contract', 'Entry Level', 'Reason'], data.decisions.flatMap(d => {
                 const directionClass = d.direction === 'bullish' ? 'bullish' : d.direction === 'bearish' ? 'bearish' : 'neutral';
                 const mainRow = `<tr>
                     <td class="symbol">${esc(d.symbol)}</td>
-                    <td><span class="${directionClass}">${esc(d.direction)}</span><br><span class="status-${esc(d.status)}">${esc(d.status)}</span><br><span class="muted">${esc(d.option_type || '-')} score ${esc(d.top_score || 0)}</span></td>
+                    <td><span class="${directionClass}">${esc(d.direction)}</span><br><span class="status-${esc(d.status)}">${esc(decisionStatusText(d.status))}</span><br><span class="muted">${esc(d.option_type || '-')} score ${esc(d.top_score || 0)}</span></td>
                     <td>${pct(d.consensus)}<br><span class="muted">Bull ${usd(d.bullish_premium)} / Bear ${usd(d.bearish_premium)}</span></td>
                     <td>${keyLevels(d)}</td>
                     <td>${contractPreview(d)}</td>
-                    <td>${levels(d.target_levels)}</td>
+                    <td>${entryLevel(d)}</td>
                     <td>${esc(d.reason || '')}<br><span class="muted">Rows ${esc(d.directional_row_count || 0)} of ${esc(d.raw_row_count || 0)}</span></td>
                 </tr>`;
                 return [mainRow, flowDetails(d)];
@@ -939,6 +1065,14 @@ DASHBOARD_HTML = """<!doctype html>
                 <td>${targetPlan(p)}</td>
                 <td>${esc(p.entry_status || '-')}<br><span class="muted">${esc(p.setup_type || 'signal')} ${esc(p.swept_level || '-')}</span></td>
             </tr>`), 'No active positions.');
+            table('closed-positions', ['Symbol', 'Contract', 'Entry / Exit', 'Qty', 'Realized PnL', 'Reason'], (data.closed_positions || []).map(p => `<tr>
+                <td class="symbol">${esc(p.symbol || '-')}</td>
+                <td>${esc(p.option_symbol || '-')}<br><span class="muted">${esc(p.option_type || '')} ${esc(p.setup_type || '')}</span></td>
+                <td>In ${premium(p.avg_entry_price)}<br><span class="muted">Out ${premium(p.avg_exit_price)} / ${shortDateTime(p.exit_time)}</span></td>
+                <td>${esc(p.entry_qty || '-')}</td>
+                <td><span class="${pnlClass(p.realized_pl)}">${signedUsd(p.realized_pl)} / ${pct(p.realized_plpc)}</span><br><span class="muted">Cost ${usd(p.cost_basis)} / Proceeds ${usd(p.proceeds)}</span></td>
+                <td>${esc(p.close_reason || '-')}</td>
+            </tr>`), 'No closed positions yet.');
             table('orders', ['Symbol', 'Side', 'Type', 'Qty', 'Status', 'Limit / Stop'], data.broker_open_orders.map(o => `<tr>
                 <td class="symbol">${esc(o.symbol || '-')}</td>
                 <td>${esc(o.side || '-')}</td>

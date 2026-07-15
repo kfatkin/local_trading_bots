@@ -64,7 +64,8 @@ from .market_data import (
     previous_calendar_week_sessions,
     resolve_trading_sessions,
 )
-from .models import KeyLevel, TradeSetup
+from .models import FlowBias, KeyLevel, TradeSetup
+from .oi_watchlist import load_morning_watchlist
 from .option_selection import account_balance_summary, build_contract_preview, empty_contract_preview, option_market_snapshot, validate_entry_contract
 from .state import (
     CONTEXT_LOCK,
@@ -89,9 +90,10 @@ from .utils import create_client_order_id, get_value, is_option_asset, key_level
 
 
 CONTRACT_PREVIEW_LOCK = threading.Lock()
-CONTRACT_PREVIEW_STATUSES = {"flow_bias", "flow_preview", "ready"}
+CONTRACT_PREVIEW_STATUSES = {"orb_wait", "ready"}
 pending_sweep_confirmations = {}
 continuation_contexts = {}
+opening_ranges = {}
 
 
 def log_startup_context():
@@ -107,23 +109,18 @@ def log_startup_context():
         account_summary.get("buying_power"),
     )
     LOGGER.info(
-        "Starting flow sweep bot for %d symbols. market_open=%s next_open=%s next_close=%s",
-        len(SYMBOLS),
+        "Starting local ORB options bot. market_open=%s next_open=%s next_close=%s",
         clock.is_open,
         clock.next_open,
         clock.next_close,
     )
     LOGGER.info(
-        "UW source: table=%s region=%s profile=%s partition=%s min_score=>%s consensus>=%.0f%%",
-        UW_TABLE_NAME,
-        AWS_REGION,
+        "Morning watchlist source: UW OI change using fattytrades-compatible filters. aws_profile=%s aws_region=%s",
         AWS_PROFILE or "default",
-        FLOW_SCORE_PARTITION,
-        MIN_FLOW_SCORE,
-        CONSENSUS_THRESHOLD * 100,
+        AWS_REGION,
     )
     LOGGER.info(
-        "Orders: allocation=%.1f%% account_balance target_delta=%.2f premium_cap=none data_feed=%s",
+        "Orders: allocation=%.1f%% account_balance target_delta=%.2f planned premium band from watchlist data_feed=%s",
         TRADE_ALLOCATION_PCT * 100,
         TARGET_DELTA,
         ALPACA_DATA_FEED or "default",
@@ -307,8 +304,9 @@ def attach_contract_previews(decisions):
 
     for symbol, decision in decisions.items():
         option_type = decision.get("option_type")
+        contract_plan = decision.get("contract_plan") or None
         if should_preview_contract(decision):
-            decision["contract_preview"] = build_contract_preview(symbol, option_type, account=account)
+            decision["contract_preview"] = build_contract_preview(symbol, option_type, account=account, contract_plan=contract_plan)
         else:
             decision["contract_preview"] = empty_contract_preview(symbol, option_type, reason="No planned entry for this symbol", account=account)
     return account
@@ -335,7 +333,9 @@ def publish_contract_preview(symbol, contract, reason):
 
 
 def build_fresh_entry_contract(symbol, option_type):
-    contract = build_contract_preview(symbol, option_type)
+    with CONTEXT_LOCK:
+        decision = dict((daily_context.get("decisions") or {}).get(symbol) or {})
+    contract = build_contract_preview(symbol, option_type, contract_plan=decision.get("contract_plan") or None)
     publish_contract_preview(symbol, contract, "entry_recheck")
     LOGGER.info(
         "Entry contract recheck %s %s selected=%s status=%s delta=%s bid=%s ask=%s qty=%s reason=%s",
@@ -415,6 +415,68 @@ def query_prior_session_flow(prior_open, prior_close):
     return biases, decisions
 
 
+def opening_range_levels(symbol):
+    orb = opening_ranges.get(symbol)
+    if not orb or not orb.get("completed"):
+        return [
+            level_payload("opening_range_low", "Opening 5m Low", "support", status="pending", note="Waiting for the first 5m range"),
+            level_payload("opening_range_high", "Opening 5m High", "resistance", status="pending", note="Waiting for the first 5m range"),
+        ]
+    return [
+        level_payload("opening_range_low", "Opening 5m Low", "support", orb.get("low"), note="1m closes back inside this range count toward the stop"),
+        level_payload("opening_range_high", "Opening 5m High", "resistance", orb.get("high"), note="1m closes back inside this range count toward the stop"),
+    ]
+
+
+def refresh_intraday_decisions(now_et=None):
+    now_et = now_et or datetime.now(ET)
+    with CONTEXT_LOCK:
+        decisions = daily_context.get("decisions") or {}
+        for symbol, decision in decisions.items():
+            orb = opening_ranges.get(symbol)
+            decision["key_levels"] = opening_range_levels(symbol)
+            if now_et.time() < REGULAR_OPEN:
+                decision["status"] = "staged"
+                decision["reason"] = "Ticker staged in watchlist; contract selection begins at the regular open"
+                decision["trigger_levels"] = []
+                decision["target_levels"] = []
+            elif not orb or not orb.get("completed"):
+                decision["status"] = "orb_wait"
+                decision["reason"] = "Contract planned; waiting for the opening 5m range to complete"
+                decision["trigger_levels"] = []
+                decision["target_levels"] = []
+            else:
+                trigger_level = orb["high"] if decision.get("direction") == "bullish" else orb["low"]
+                trigger_name = "opening_range_high" if decision.get("direction") == "bullish" else "opening_range_low"
+                decision["trigger_levels"] = [key_level_to_dict(KeyLevel(trigger_name, trigger_level))]
+                decision["target_levels"] = []
+                decision["status"] = "ready"
+                decision["reason"] = f"Waiting for a 1m close outside the opening 5m range {orb['low']:.2f}-{orb['high']:.2f}"
+
+
+def morning_watchlist_setups(now_et):
+    decisions = load_morning_watchlist(now_et=now_et)
+    setups = {}
+    for symbol, decision in decisions.items():
+        direction = decision.get("direction") or "neutral"
+        setups[symbol] = TradeSetup(
+            symbol,
+            FlowBias(
+                symbol,
+                direction,
+                float(decision.get("consensus") or 0.0),
+                float(decision.get("bullish_premium") or 0.0),
+                float(decision.get("bearish_premium") or 0.0),
+                float(decision.get("total_premium") or 0.0),
+                int(decision.get("top_score") or 0),
+                int(decision.get("directional_row_count") or 0),
+            ),
+            tuple(),
+            tuple(),
+        )
+    return setups, decisions
+
+
 def prepare_daily_context(now_et=None, force=False):
     now_et = now_et or datetime.now(ET)
     with CONTEXT_LOCK:
@@ -424,67 +486,21 @@ def prepare_daily_context(now_et=None, force=False):
 
         schedule, trading_idx, trading_day, prior_day = resolve_trading_sessions(now_et)
         if daily_context["prepared"] and daily_context["session"] == trading_day.isoformat():
+            refresh_intraday_decisions(now_et)
             return
 
         reset_daily_trade_state_if_needed(trading_day)
         if daily_context.get("session") != trading_day.isoformat():
             pending_sweep_confirmations.clear()
             continuation_contexts.clear()
+            opening_ranges.clear()
 
-        prior_open = schedule.iloc[trading_idx - 1]["market_open"].to_pydatetime().astimezone(UTC)
-        prior_close = schedule.iloc[trading_idx - 1]["market_close"].to_pydatetime().astimezone(UTC)
-        biases, decisions = query_prior_session_flow(prior_open, prior_close)
-        week_sessions = previous_calendar_week_sessions(schedule, trading_day)
-        include_premarket = now_et.date() == trading_day and now_et.time() >= REGULAR_OPEN
-
-        for symbol, decision in decisions.items():
-            key_levels = build_symbol_key_levels(symbol, trading_day, prior_day, week_sessions, include_premarket)
-            decision["key_levels"] = apply_level_roles(key_levels, biases.get(symbol))
-
-        if now_et.date() != trading_day or now_et.time() < REGULAR_OPEN:
-            for symbol, decision in decisions.items():
-                if decision.get("status") == "flow_bias":
-                    decision.update(
-                        {
-                            "status": "flow_preview",
-                            "reason": f"High-score flow loaded from {prior_day}; waiting for {trading_day} levels",
-                        }
-                    )
-
-            preview_context = refreshed_preview_context(decisions, reason="preopen_preview")
-
-            daily_context.update(
-                {
-                    "session": trading_day.isoformat(),
-                    "prior_session": prior_day.isoformat(),
-                    "prepared": False,
-                    "prepared_at": datetime.now(UTC).isoformat(),
-                    "setups": {},
-                    "decisions": decisions,
-                    **preview_context,
-                }
-            )
-            high_score_rows = sum(len(decision.get("flow_rows", [])) for decision in decisions.values())
-            LOGGER.info(
-                "Loaded %s high-score flow rows from prior_session=%s. Waiting for %s premarket to complete before preparing setups.",
-                high_score_rows,
-                prior_day,
-                trading_day,
-            )
-            return
-
-        setups = {}
-        for symbol, bias in biases.items():
-            if not bias:
-                continue
-            setup = setup_from_key_levels(symbol, bias, decisions[symbol].get("key_levels", []))
-            if setup:
-                setups[symbol] = setup
-                decisions[symbol].update(setup_plan_summary(setup))
-            else:
-                decisions[symbol].update({"status": "skipped", "reason": "Missing one or more chart levels"})
-
-        preview_context = refreshed_preview_context(decisions, reason="market_open_setup")
+        setups, decisions = morning_watchlist_setups(now_et)
+        refresh_intraday_decisions(now_et)
+        preview_context = refreshed_preview_context(
+            decisions,
+            reason="preopen_watchlist" if now_et.time() < REGULAR_OPEN else "opening_watchlist",
+        )
 
         daily_context.update(
             {
@@ -497,7 +513,7 @@ def prepare_daily_context(now_et=None, force=False):
                 **preview_context,
             }
         )
-        LOGGER.info("Prepared %s flow sweep setups for session=%s prior_session=%s", len(setups), trading_day, prior_day)
+        LOGGER.info("Prepared %s morning OI watchlist setups for session=%s prior_session=%s", len(setups), trading_day, prior_day)
 
 
 def risk_plan_for_entry(option_type, entry_underlying, stop_underlying, target_underlying):
@@ -807,6 +823,34 @@ def continuation_entry_metadata(zone, signal_bar):
     }
 
 
+def orb_entry_metadata(setup, signal_bar):
+    option_type = "CALL" if setup.bias.direction == "bullish" else "PUT"
+    orb = opening_ranges.get(setup.symbol) or {}
+    breakout_level = orb.get("high") if option_type == "CALL" else orb.get("low")
+    breakout_name = "opening_range_high" if option_type == "CALL" else "opening_range_low"
+    return {
+        "setup_type": "opening_range_breakout",
+        "signal_name": breakout_name,
+        "signal_price": breakout_level,
+        "signal_label": "1m ORB close breakout",
+        "stop_underlying": orb.get("low") if option_type == "CALL" else orb.get("high"),
+        "stop_mode": "orb_range_reentry",
+        "signal_time": signal_bar.get("timestamp") or signal_bar.get("close_time"),
+        "position_fields": {
+            "opening_range_high": orb.get("high"),
+            "opening_range_low": orb.get("low"),
+            "orb_completed_at": orb.get("completed_at").isoformat() if hasattr(orb.get("completed_at"), "isoformat") else orb.get("completed_at"),
+            "orb_breakout_close_time": signal_bar.get("timestamp").isoformat() if hasattr(signal_bar.get("timestamp"), "isoformat") else signal_bar.get("timestamp"),
+        },
+        "event_fields": {
+            "opening_range_high": orb.get("high"),
+            "opening_range_low": orb.get("low"),
+            "orb_completed_at": orb.get("completed_at"),
+            "orb_breakout_close_time": signal_bar.get("timestamp"),
+        },
+    }
+
+
 def execute_entry(symbol, setup, signal_bar, entry_metadata):
     with STATE_LOCK:
         if symbol in active_positions or symbol in pending_entry_orders.values():
@@ -834,51 +878,6 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
     stop_mode = entry_metadata.get("stop_mode", "underlying_sweep_extreme")
     position_fields = dict(entry_metadata.get("position_fields") or {})
     event_fields = dict(entry_metadata.get("event_fields") or {})
-    target_level, risk_plan = target_level_for_entry(setup, option_type, signal_bar["close"], stop_underlying)
-    if not target_level or not risk_plan:
-        LOGGER.info(
-            "Skipping %s: invalid risk distance for entry %.2f stop %.2f",
-            symbol,
-            signal_bar["close"],
-            stop_underlying,
-        )
-        record_trade_event(
-            "entry_skipped",
-            symbol=symbol,
-            setup_type=setup_type,
-            option_type=option_type,
-            reason="invalid risk distance",
-            entry_underlying=signal_bar["close"],
-            stop_underlying=stop_underlying,
-            swept_level=signal_name,
-            swept_level_price=signal_price,
-            signal_name=signal_name,
-            signal_price=signal_price,
-            **event_fields,
-        )
-        return False
-
-    quality_reason = entry_risk_quality_reason(risk_plan)
-    if quality_reason:
-        LOGGER.info("Skipping %s: %s", symbol, quality_reason)
-        record_trade_event(
-            "entry_skipped",
-            symbol=symbol,
-            setup_type=setup_type,
-            option_type=option_type,
-            reason=quality_reason,
-            entry_underlying=signal_bar["close"],
-            stop_underlying=stop_underlying,
-            target_underlying=target_level.price,
-            target_name=target_level.name,
-            target_r_multiple=risk_plan.get("target_r_multiple"),
-            swept_level=signal_name,
-            swept_level_price=signal_price,
-            signal_name=signal_name,
-            signal_price=signal_price,
-            **event_fields,
-        )
-        return False
 
     contract = build_fresh_entry_contract(symbol, option_type)
     preflight = validate_entry_contract(contract, require_market_open=True)
@@ -911,16 +910,14 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
     qty = to_int_qty(contract.get("quantity", 0))
     signal_text = f"{signal_name} {signal_price:.2f}" if signal_price is not None else signal_name
     LOGGER.info(
-        "ENTER %s %s via %s (%s) entry close %.2f stop %.2f target %s %.2f %.2fR: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
+        "ENTER %s %s via %s (%s) entry close %.2f OR high/low %.2f/%.2f: %sx %s ask=%.2f delta=%.4f gamma=%s theta=%s exp=%s account_balance=%.2f allocation=%.2f",
         symbol,
         option_type,
         signal_label,
         signal_text,
         signal_bar["close"],
-        stop_underlying,
-        target_level.name,
-        target_level.price,
-        risk_plan["target_r_multiple"],
+        position_fields.get("opening_range_high") or 0.0,
+        position_fields.get("opening_range_low") or 0.0,
         qty,
         contract["symbol"],
         contract["ask"],
@@ -966,35 +963,18 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
             "initial_stop_underlying": stop_underlying,
             "stop_underlying": stop_underlying,
             "stop_mode": stop_mode,
-            "target_underlying": target_level.price,
-            "target_name": target_level.name,
-            "target_exit_method": "market_on_underlying_target",
-            "target_required_r_multiple": TARGET_R_MULTIPLE,
-            **risk_plan,
+            "target_underlying": None,
+            "target_name": "option_100pct",
+            "target_exit_method": "market_on_option_gain",
+            "target_r_multiple": None,
             "breakeven_active": False,
-            "breakeven_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
             "breakeven_stop_option_price": contract.get("ask"),
-            "partial_exit_pct": PARTIAL_EXIT_PCT,
-            "partial_exit_taken": False,
-            "partial_exit_trigger_r_multiple": BREAKEVEN_TRIGGER_R_MULTIPLE,
-            "partial_exit_trigger_underlying": risk_plan["breakeven_trigger_underlying"],
-            "runner_profit_floor_entry_multiple": RUNNER_PROFIT_FLOOR_ENTRY_MULTIPLE,
-            "runner_profit_floor_partial_multiple": RUNNER_PROFIT_FLOOR_PARTIAL_MULTIPLE,
-            "runner_extension_r_multiple": RUNNER_EXTENSION_R_MULTIPLE,
-            "runner_extension_reached": False,
-            "runner_max_r_multiple": 0.0,
-            "runner_stall_r_multiple": RUNNER_STALL_R_MULTIPLE,
-            "runner_stall_minutes": RUNNER_STALL_MINUTES,
-            "second_partial_exit_pct": SECOND_PARTIAL_EXIT_PCT,
-            "second_partial_taken": False,
-            "second_partial_trigger_r_multiple": SECOND_PARTIAL_EXIT_R_MULTIPLE,
-            "pre_breakeven_option_lock_enabled": PRE_BREAKEVEN_OPTION_LOCK_ENABLED,
-            "pre_breakeven_option_lock_trigger_pct": PRE_BREAKEVEN_OPTION_LOCK_TRIGGER_PCT,
-            "pre_breakeven_option_floor_pct": PRE_BREAKEVEN_OPTION_FLOOR_PCT,
-            "pre_breakeven_option_hard_stop_loss_pct": PRE_BREAKEVEN_OPTION_HARD_STOP_LOSS_PCT,
-            "no_progress_exit_enabled": NO_PROGRESS_EXIT_ENABLED,
-            "no_progress_minutes": NO_PROGRESS_MINUTES,
-            "no_progress_min_option_gain_pct": NO_PROGRESS_MIN_OPTION_GAIN_PCT,
+            "profit_lock_start_pct": 0.25,
+            "profit_lock_step_pct": 0.25,
+            "profit_lock_pct": None,
+            "profit_lock_option_price": None,
+            "profit_target_pct": 1.0,
+            "range_reentry_close_count": 0,
             "swept_level": signal_name,
             "swept_level_price": signal_price,
             "signal_name": signal_name,
@@ -1029,9 +1009,6 @@ def execute_entry(symbol, setup, signal_bar, entry_metadata):
             order_type="market",
             entry_underlying=signal_bar["close"],
             stop_underlying=stop_underlying,
-            target_underlying=target_level.price,
-            target_name=target_level.name,
-            target_r_multiple=risk_plan.get("target_r_multiple"),
             swept_level=signal_name,
             swept_level_price=signal_price,
             signal_name=signal_name,
@@ -1416,172 +1393,43 @@ def in_entry_window(close_time_et):
 
 def process_completed_five_minute_bar(symbol, bar):
     refresh_contract_previews_if_needed(reason="five_minute_bar")
-    if daily_profit_lock_blocks_entries():
-        pending_sweep_confirmations.pop(symbol, None)
-        continuation_contexts.pop(symbol, None)
-        record_trade_event(
-            "entry_blocked",
-            symbol=symbol,
-            event_id=f"entry-blocked-daily-profit-lock:{symbol}:{bar['close_time'].isoformat()}",
-            reason="daily profit lock active",
-            daily_profit_lock=daily_trade_state.get("daily_profit_lock"),
-        )
-        return
+    if bar.get("bucket") and bar["bucket"].time() == REGULAR_OPEN:
+        opening_ranges[symbol] = {
+            "high": round(float(bar["high"]), 4),
+            "low": round(float(bar["low"]), 4),
+            "completed": True,
+            "completed_at": bar.get("close_time"),
+        }
+        refresh_intraday_decisions(bar.get("close_time") or datetime.now(ET))
+        LOGGER.info("%s opening 5m range set %.2f-%.2f", symbol, opening_ranges[symbol]["low"], opening_ranges[symbol]["high"])
 
-    close_clock = bar["close_time"].time()
-    if close_clock >= ENTRY_WINDOW_END:
-        pending_sweep_confirmations.pop(symbol, None)
-        continuation_contexts.pop(symbol, None)
+
+def process_orb_entry_signal(symbol, minute_bar):
+    if daily_profit_lock_blocks_entries():
         return
-    if close_clock < ENTRY_WINDOW_START:
+    orb = opening_ranges.get(symbol)
+    if not orb or not orb.get("completed"):
+        return
+    timestamp = minute_bar.get("timestamp")
+    if not timestamp or timestamp.time() < ENTRY_WINDOW_START or timestamp.time() >= ENTRY_WINDOW_END:
+        return
+    completed_at = orb.get("completed_at")
+    if completed_at and timestamp < completed_at:
         return
 
     setup = current_setup(symbol)
     if not setup or was_symbol_traded_today(symbol):
-        pending_sweep_confirmations.pop(symbol, None)
-        continuation_contexts.pop(symbol, None)
         return
+    with STATE_LOCK:
+        if symbol in active_positions or symbol in pending_entry_orders.values():
+            return
 
-    if ENABLE_CONTINUATION_FVG:
-        context = continuation_contexts.setdefault(symbol, new_continuation_context())
+    if setup.bias.direction == "bullish":
+        triggered = minute_bar["close"] > orb["high"]
     else:
-        continuation_contexts.pop(symbol, None)
-        context = None
-    candidates = []
-
-    pending = pending_sweep_confirmations.pop(symbol, None)
-    if pending:
-        ready, reason = confirmation_entry_ready(setup, pending["swept_level"], pending["signal_bar"], bar)
-        if ready:
-            candidates.append(
-                {
-                    "armed_at": pending["signal_bar"].get("close_time"),
-                    "metadata": sweep_entry_metadata(setup, pending["swept_level"], bar, pending["signal_bar"]),
-                }
-            )
-        else:
-            LOGGER.info("%s sweep confirmation failed: %s", symbol, reason)
-            record_trade_event(
-                "entry_skipped",
-                symbol=symbol,
-                event_id=f"entry-confirmation-failed:{symbol}:{pending['signal_bar']['close_time'].isoformat()}",
-                setup_type="flow_sweep",
-                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-                reason=f"sweep confirmation failed: {reason}",
-                swept_level=pending["swept_level"].name,
-                swept_level_price=pending["swept_level"].price,
-                sweep_signal_close_time=pending["signal_bar"].get("close_time"),
-            )
-
-    active_zone = context.get("active_zone") if context else None
-    if ENABLE_CONTINUATION_FVG and active_zone:
-        status, reason = continuation_zone_status(setup, active_zone, bar)
-        if status == "ready":
-            candidates.append({"armed_at": active_zone.get("armed_at"), "metadata": continuation_entry_metadata(active_zone, bar)})
-        elif status == "invalidated":
-            LOGGER.info("%s continuation FVG invalidated: %s", symbol, reason)
-            record_trade_event(
-                "entry_skipped",
-                symbol=symbol,
-                event_id=f"entry-continuation-invalidated:{symbol}:{active_zone['armed_at'].isoformat()}",
-                setup_type="continuation_fvg",
-                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-                reason=reason,
-                swept_level=active_zone["signal_name"],
-                swept_level_price=round((active_zone["zone_low"] + active_zone["zone_high"]) / 2, 4),
-                continuation_zone_low=active_zone["zone_low"],
-                continuation_zone_high=active_zone["zone_high"],
-                continuation_structure_price=active_zone["structure_price"],
-                continuation_signal_close_time=active_zone.get("armed_at"),
-            )
-            context["active_zone"] = None
-
-    if candidates:
-        candidates.sort(
-            key=lambda item: (
-                item["armed_at"].isoformat() if hasattr(item.get("armed_at"), "isoformat") else "9999-12-31T23:59:59+00:00",
-                item["metadata"].get("setup_type") != "flow_sweep",
-            )
-        )
-        for candidate in candidates:
-            if execute_entry(symbol, setup, bar, candidate["metadata"]):
-                pending_sweep_confirmations.pop(symbol, None)
-                continuation_contexts.pop(symbol, None)
-                return
-
-    expired_zone = age_active_continuation_zone(context) if context else None
-    if ENABLE_CONTINUATION_FVG and expired_zone:
-        LOGGER.info("%s continuation FVG expired without entry after %s bars", symbol, expired_zone["age_bars"])
-        record_trade_event(
-            "entry_skipped",
-            symbol=symbol,
-            event_id=f"entry-continuation-expired:{symbol}:{expired_zone['armed_at'].isoformat()}",
-            setup_type="continuation_fvg",
-            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-            reason="continuation FVG expired before a valid touch-and-close entry",
-            swept_level=expired_zone["signal_name"],
-            swept_level_price=round((expired_zone["zone_low"] + expired_zone["zone_high"]) / 2, 4),
-            continuation_zone_low=expired_zone["zone_low"],
-            continuation_zone_high=expired_zone["zone_high"],
-            continuation_structure_price=expired_zone["structure_price"],
-            continuation_signal_close_time=expired_zone.get("armed_at"),
-        )
-
-    if ENABLE_CONTINUATION_FVG and context:
-        context["recent_bars"].append(bar.copy())
-        trim_tail(context["recent_bars"])
-        update_continuation_swings(context)
-
-        new_zone = build_continuation_zone(setup, context, bar)
-        if new_zone and (not context.get("active_zone") or new_zone["armed_at"] >= context["active_zone"]["armed_at"]):
-            context["active_zone"] = new_zone
-            LOGGER.info(
-                "%s %s continuation FVG armed %.2f-%.2f with structure %.2f at %s",
-                symbol,
-                setup.bias.direction,
-                new_zone["zone_low"],
-                new_zone["zone_high"],
-                new_zone["structure_price"],
-                new_zone["armed_at"],
-            )
-            record_trade_event(
-                "entry_signal",
-                symbol=symbol,
-                event_id=f"entry-continuation-signal:{symbol}:{new_zone['armed_at'].isoformat()}",
-                setup_type="continuation_fvg",
-                option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-                swept_level=new_zone["signal_name"],
-                swept_level_price=round((new_zone["zone_low"] + new_zone["zone_high"]) / 2, 4),
-                continuation_zone_low=new_zone["zone_low"],
-                continuation_zone_high=new_zone["zone_high"],
-                continuation_break_level=new_zone["break_level_price"],
-                continuation_structure_price=new_zone["structure_price"],
-                continuation_signal_close_time=new_zone.get("armed_at"),
-                reason="bullish continuation FVG armed" if setup.bias.direction == "bullish" else "bearish continuation FVG armed",
-            )
-
-    swept_level = swept_level_for_bar(setup, bar)
-    if swept_level:
-        pending_sweep_confirmations[symbol] = {"swept_level": swept_level, "signal_bar": bar.copy()}
-        LOGGER.info(
-            "%s %s swept %s %.2f at %s; waiting for next 5m confirmation",
-            symbol,
-            setup.bias.direction,
-            swept_level.name,
-            swept_level.price,
-            bar["close_time"],
-        )
-        record_trade_event(
-            "entry_signal",
-            symbol=symbol,
-            event_id=f"entry-signal:{symbol}:{bar['close_time'].isoformat()}",
-            setup_type="flow_sweep",
-            option_type="CALL" if setup.bias.direction == "bullish" else "PUT",
-            swept_level=swept_level.name,
-            swept_level_price=swept_level.price,
-            sweep_signal_close_time=bar.get("close_time"),
-            reason="meaningful sweep/reclaim detected; waiting for next 5m confirmation",
-        )
+        triggered = minute_bar["close"] < orb["low"]
+    if triggered:
+        execute_entry(symbol, setup, minute_bar, orb_entry_metadata(setup, minute_bar))
 
 
 def breakeven_trigger_hit(option_type, minute_bar, trigger_underlying):
@@ -2096,57 +1944,71 @@ def manage_open_position_with_bar(symbol, minute_bar):
         is_live_position = position["entry_status"] in {"partial_fill", "filled"} and position["total_qty"] > 0
         if not is_live_position:
             return
-        option_type = position["option_type"]
         total_qty = position["total_qty"]
-        stop_underlying = float(position["stop_underlying"])
-        target_underlying = float(position["target_underlying"])
         option_symbol = position["option_symbol"]
-        breakeven_active = bool(position.get("breakeven_active"))
-        breakeven_trigger_underlying = position.get("breakeven_trigger_underlying")
-        partial_exit_taken = bool(position.get("partial_exit_taken"))
 
-    if option_type == "CALL":
-        stop_hit = minute_bar["low"] <= stop_underlying
-        target_hit = minute_bar["high"] >= target_underlying
-    else:
-        stop_hit = minute_bar["high"] >= stop_underlying
-        target_hit = minute_bar["low"] <= target_underlying
+    opening_range_high = position.get("opening_range_high")
+    opening_range_low = position.get("opening_range_low")
+    if opening_range_high not in (None, "") and opening_range_low not in (None, ""):
+        inside_range = float(opening_range_low) <= float(minute_bar["close"]) <= float(opening_range_high)
+        with STATE_LOCK:
+            latest = active_positions.get(symbol)
+            if latest:
+                latest["range_reentry_close_count"] = (int(latest.get("range_reentry_close_count") or 0) + 1) if inside_range else 0
+                latest["last_underlying_close"] = minute_bar["close"]
+                persist_state_locked()
+                if int(latest.get("range_reentry_close_count") or 0) >= 3:
+                    execute_exit(symbol, total_qty, "STOP_ORB_RANGE_REENTRY_3_CLOSES")
+                    return
 
-    if target_hit:
-        target_r_multiple = float(position.get("target_r_multiple") or 0.0)
-        execute_exit(symbol, total_qty, f"TARGET_{position.get('target_name', 'LEVEL')}_{target_r_multiple:.2f}R")
-        return
-    if not breakeven_active and stop_hit:
-        execute_exit(symbol, total_qty, "STOP_SWEEP_EXTREME")
-        return
+    entry_price = entry_option_price(position)
+    market_price = current_option_market_price(symbol, option_symbol)
+    if market_price is not None:
+        with STATE_LOCK:
+            latest = active_positions.get(symbol)
+            if latest:
+                prior_peak = float(latest.get("highest_option_market_price") or 0.0)
+                latest["highest_option_market_price"] = round(max(prior_peak, market_price), 4)
+                if entry_price not in (None, 0):
+                    latest["latest_option_gain_pct"] = round((market_price - entry_price) / entry_price, 4)
+                persist_state_locked()
 
-    if not breakeven_active and manage_pre_breakeven_option_risk(symbol, position, minute_bar):
-        return
-
-    if not breakeven_active and breakeven_trigger_hit(option_type, minute_bar, breakeven_trigger_underlying):
-        activate_breakeven_stop(symbol)
-        breakeven_active = True
-        if not partial_exit_taken:
-            request_partial_exit(symbol, total_qty)
-
-    if breakeven_active:
-        position = update_runner_progress(symbol, minute_bar) or position
-        latest_total_qty = to_int_qty(position.get("total_qty", total_qty))
-        if (
-            runner_management_ready(position)
-            and not position.get("second_partial_taken")
-            and float(position.get("runner_max_r_multiple") or 0.0) >= SECOND_PARTIAL_EXIT_R_MULTIPLE
-        ):
-            request_second_partial_exit(symbol, latest_total_qty)
+    if entry_price and market_price is not None and entry_price > 0:
+        gain_pct = (market_price - entry_price) / entry_price
+        if gain_pct >= 1.0:
+            execute_exit(symbol, total_qty, "TARGET_OPTION_100PCT")
             return
-        if runner_stall_exit_hit(position, minute_bar):
-            execute_exit(symbol, latest_total_qty, "STOP_RUNNER_STALL")
-            return
-        stop_option_price = position.get("runner_profit_floor_option_price") or position.get("breakeven_stop_option_price")
-        stop_reason = "STOP_OPTION_PROFIT_FLOOR" if position.get("runner_profit_floor_option_price") else "STOP_OPTION_BREAKEVEN"
-        stop_label = "profit_floor" if position.get("runner_profit_floor_option_price") else "breakeven"
-        if runner_management_ready(position) and option_profit_stop_hit(symbol, option_symbol, stop_option_price, stop_label):
-            execute_exit(symbol, latest_total_qty, stop_reason)
+
+        profit_lock_pct = None
+        if gain_pct >= 0.25:
+            profit_lock_pct = max(0.0, int((gain_pct - 0.25) // 0.25) * 0.25)
+
+        with STATE_LOCK:
+            latest = active_positions.get(symbol)
+            if latest and profit_lock_pct is not None:
+                current_lock = latest.get("profit_lock_pct")
+                if current_lock in (None, "") or profit_lock_pct > float(current_lock):
+                    latest["profit_lock_pct"] = round(profit_lock_pct, 4)
+                    latest["profit_lock_option_price"] = round(entry_price * (1.0 + profit_lock_pct), 4)
+                    latest["breakeven_active"] = profit_lock_pct <= 0.0
+                    record_trade_event_locked(
+                        "profit_lock_advanced",
+                        symbol=symbol,
+                        event_id=f"profit-lock:{symbol}:{minute_bar['timestamp'].isoformat()}:{profit_lock_pct:.2f}",
+                        option_symbol=option_symbol,
+                        gain_pct=round(gain_pct, 4),
+                        profit_lock_pct=round(profit_lock_pct, 4),
+                        profit_lock_option_price=latest["profit_lock_option_price"],
+                    )
+                    persist_state_locked()
+
+        with STATE_LOCK:
+            latest = active_positions.get(symbol)
+            lock_price = latest.get("profit_lock_option_price") if latest else None
+            lock_pct = latest.get("profit_lock_pct") if latest else None
+        if lock_price not in (None, "") and market_price <= float(lock_price):
+            lock_label = "BE" if float(lock_pct or 0.0) <= 0.0 else f"{int(float(lock_pct) * 100)}PCT"
+            execute_exit(symbol, total_qty, f"STOP_OPTION_TRAIL_{lock_label}")
             return
     if minute_bar["timestamp"].time() >= EOD_EXIT_TIME:
         execute_exit(symbol, total_qty, "EOD_EXIT")
@@ -2166,6 +2028,7 @@ async def handle_bar(bar):
     completed = update_five_minute_bar(symbol, minute_bar)
     if completed:
         process_completed_five_minute_bar(symbol, completed)
+    process_orb_entry_signal(symbol, minute_bar)
 
 
 def start_trading_stream():
