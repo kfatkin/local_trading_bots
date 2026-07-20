@@ -22,6 +22,7 @@ from .config import (
     OI_WATCHLIST_MAX_MULTI_LEG_SHARE,
     OI_WATCHLIST_MIN_ASK_MID_RATIO,
     OI_WATCHLIST_MIN_CONTRACT_PRICE,
+    OI_WATCHLIST_REQUIRE_ASK_SIDE,
     REGULAR_OPEN,
     UW_API_KEY,
 )
@@ -186,6 +187,16 @@ def _normalize_date(value):
     return datetime.now(ET).date().isoformat()
 
 
+def _row_value(row, *keys):
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def _parse_option_symbol(option_symbol):
     match = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", option_symbol.strip().upper())
     if not match:
@@ -215,14 +226,14 @@ def _compute_dte(current_date, expiration):
 
 
 def _normalize_row(row):
-    option_symbol = str(row.get("option_symbol") or "").strip().upper()
-    underlying_symbol = str(row.get("underlying_symbol") or "").strip().upper()
+    option_symbol = str(_row_value(row, "option_symbol", "optionSymbol") or "").strip().upper()
+    underlying_symbol = str(_row_value(row, "underlying_symbol", "underlyingSymbol") or "").strip().upper()
     if not option_symbol or not underlying_symbol:
         return None
 
     contract = _parse_option_symbol(option_symbol)
-    current_date = _normalize_date(row.get("curr_date"))
-    previous_date = _normalize_date(row.get("last_date"))
+    current_date = _normalize_date(_row_value(row, "curr_date", "currentDate"))
+    previous_date = _normalize_date(_row_value(row, "last_date", "previousDate"))
     option_type = contract["option_type"]
     if option_type not in {"call", "put"}:
         return None
@@ -236,26 +247,26 @@ def _normalize_row(row):
         "currentDate": current_date,
         "previousDate": previous_date,
         "dte": _compute_dte(current_date, contract["expiration"]),
-        "currentOi": _to_number(row.get("curr_oi")),
-        "previousOi": _to_number(row.get("last_oi")),
-        "oiDiff": _to_number(row.get("oi_diff_plain")),
-        "oiChangeRatio": _to_number(row.get("oi_change")),
-        "oiChangePct": (_to_number(row.get("oi_change")) or 0.0) * 100,
-        "volume": _to_number(row.get("volume")),
-        "trades": _to_number(row.get("trades")),
-        "avgPrice": _to_number(row.get("avg_price")),
-        "lastBid": _to_number(row.get("last_bid")),
-        "lastAsk": _to_number(row.get("last_ask")),
-        "lastFill": _to_number(row.get("last_fill")),
-        "rank": _to_number(row.get("rnk")),
-        "percentageOfTotal": _to_number(row.get("percentage_of_total")),
-        "previousAskVolume": _to_number(row.get("prev_ask_volume")) or 0.0,
-        "previousBidVolume": _to_number(row.get("prev_bid_volume")) or 0.0,
-        "previousMidVolume": _to_number(row.get("prev_mid_volume")) or 0.0,
-        "previousNeutralVolume": _to_number(row.get("prev_neutral_volume")) or 0.0,
-        "previousMultiLegVolume": _to_number(row.get("prev_multi_leg_volume")) or 0.0,
-        "previousStockMultiLegVolume": _to_number(row.get("prev_stock_multi_leg_volume")) or 0.0,
-        "previousTotalPremium": _to_number(row.get("prev_total_premium")) or 0.0,
+        "currentOi": _to_number(_row_value(row, "curr_oi", "currentOi")),
+        "previousOi": _to_number(_row_value(row, "last_oi", "previousOi")),
+        "oiDiff": _to_number(_row_value(row, "oi_diff_plain", "oiDiff")),
+        "oiChangeRatio": _to_number(_row_value(row, "oi_change", "oiChangeRatio")),
+        "oiChangePct": (_to_number(_row_value(row, "oi_change", "oiChangeRatio")) or 0.0) * 100,
+        "volume": _to_number(_row_value(row, "volume")),
+        "trades": _to_number(_row_value(row, "trades")),
+        "avgPrice": _to_number(_row_value(row, "avg_price", "avgPrice")),
+        "lastBid": _to_number(_row_value(row, "last_bid", "lastBid")),
+        "lastAsk": _to_number(_row_value(row, "last_ask", "lastAsk")),
+        "lastFill": _to_number(_row_value(row, "last_fill", "lastFill")),
+        "rank": _to_number(_row_value(row, "rnk", "rank")),
+        "percentageOfTotal": _to_number(_row_value(row, "percentage_of_total", "percentageOfTotal")),
+        "previousAskVolume": _to_number(_row_value(row, "prev_ask_volume", "previousAskVolume")) or 0.0,
+        "previousBidVolume": _to_number(_row_value(row, "prev_bid_volume", "previousBidVolume")) or 0.0,
+        "previousMidVolume": _to_number(_row_value(row, "prev_mid_volume", "previousMidVolume")) or 0.0,
+        "previousNeutralVolume": _to_number(_row_value(row, "prev_neutral_volume", "previousNeutralVolume")) or 0.0,
+        "previousMultiLegVolume": _to_number(_row_value(row, "prev_multi_leg_volume", "previousMultiLegVolume")) or 0.0,
+        "previousStockMultiLegVolume": _to_number(_row_value(row, "prev_stock_multi_leg_volume", "previousStockMultiLegVolume")) or 0.0,
+        "previousTotalPremium": _to_number(_row_value(row, "prev_total_premium", "previousTotalPremium")) or 0.0,
     }
 
 
@@ -291,19 +302,32 @@ def _should_exclude_symbol(summary):
 
 
 def fetch_oi_change_rows():
-    api_key = resolve_uw_api_key()
-    payload = _http_json(
-        OI_CHANGE_API_URL or f"{UW_API_BASE_URL}/api/market/oi-change",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "X-API-Key": api_key,
-            "Accept": "application/json, text/plain, */*",
-            "Origin": "https://unusualwhales.com",
-            "Referer": "https://unusualwhales.com/",
-            "UW-CLIENT-API-ID": UW_CLIENT_API_ID,
-        },
-    )
-    rows = payload.get("data") if isinstance(payload, dict) else None
+    url = OI_CHANGE_API_URL or f"{UW_API_BASE_URL}/api/market/oi-change"
+    headers = {"Accept": "application/json, text/plain, */*"}
+
+    if "unusualwhales.com" in url:
+        api_key = resolve_uw_api_key()
+        headers.update(
+            {
+                "Authorization": f"Bearer {api_key}",
+                "X-API-Key": api_key,
+                "Origin": "https://unusualwhales.com",
+                "Referer": "https://unusualwhales.com/",
+                "UW-CLIENT-API-ID": UW_CLIENT_API_ID,
+            }
+        )
+
+    payload = _http_json(url, headers=headers)
+    if not isinstance(payload, dict):
+        return []
+
+    snapshot = payload.get("snapshot")
+    if isinstance(snapshot, dict):
+        rows = snapshot.get("contracts")
+        if isinstance(rows, list):
+            return rows
+
+    rows = payload.get("data")
     return rows if isinstance(rows, list) else []
 
 
@@ -345,12 +369,14 @@ def _row_side_metrics(row):
 def _qualifies_for_watchlist(row):
     dte = row.get("dte")
     oi_diff = row.get("oiDiff")
+    metrics = _row_side_metrics(row)
     if dte is None or dte < 0 or dte >= OI_WATCHLIST_MAX_DTE:
         return False, [f"DTE {dte if dte is not None else 'unknown'} outside < {OI_WATCHLIST_MAX_DTE}"]
     if oi_diff is None or oi_diff <= 0:
         return False, ["open interest did not increase"]
+    if OI_WATCHLIST_REQUIRE_ASK_SIDE and metrics["side"] != "ask":
+        return False, [f"flow side {metrics['side']} is not ask-side"]
 
-    metrics = _row_side_metrics(row)
     reasons = []
     if metrics["ask_mid_ratio"] < OI_WATCHLIST_MIN_ASK_MID_RATIO:
         reasons.append(
@@ -377,6 +403,7 @@ def _candidate_display_row(candidate):
     direction = "bullish" if candidate["optionType"] == "call" else "bearish"
     reasons = [
         f"OI +{int(candidate['oiDiff'])}" if candidate.get("oiDiff") is not None else "OI delta unavailable",
+        f"{candidate.get('side') or 'unknown'} side",
         f"Ask+Mid {candidate['ask_mid_ratio'] * 100:.0f}%",
         f"Bid {candidate['bid_ratio'] * 100:.0f}%",
         f"Multi-leg {candidate['multi_leg_share'] * 100:.0f}%",
@@ -414,6 +441,18 @@ def _candidate_display_row(candidate):
     }
 
 
+def _review_display_row(candidate, accepted, review_reasons):
+    row = _candidate_display_row(candidate)
+    row.update(
+        {
+            "review_status": "accepted" if accepted else "rejected",
+            "review_reasons": review_reasons,
+            "review_summary": "Accepted into the watch list" if accepted else (review_reasons[0] if review_reasons else "Rejected"),
+        }
+    )
+    return row
+
+
 def load_morning_watchlist(now_et=None):
     now_et = now_et or datetime.now(ET)
     try:
@@ -431,12 +470,23 @@ def load_morning_watchlist(now_et=None):
         LOGGER.warning("OI watchlist Yahoo quote classification failed; continuing without exclusions: %s", exc)
 
     candidates = []
+    reviewed_by_symbol = defaultdict(list)
     for row in normalized:
         if _should_exclude_symbol(quote_types.get(row["underlyingSymbol"])):
             continue
         qualifies, reject_reasons = _qualifies_for_watchlist(row)
         metrics = _row_side_metrics(row)
         enriched = {**row, **metrics, "reject_reasons": reject_reasons}
+        review_reasons = [
+            f"DTE {int(enriched['dte'])} accepted" if enriched.get("dte") is not None else "DTE unknown",
+            f"OI +{int(enriched['oiDiff'])}" if enriched.get("oiDiff") is not None else "OI delta unavailable",
+            f"{enriched['side']} side",
+            f"Ask+Mid {enriched['ask_mid_ratio'] * 100:.0f}%",
+            f"Multi-leg {enriched['multi_leg_share'] * 100:.0f}%",
+        ]
+        reviewed_by_symbol[enriched["underlyingSymbol"]].append(
+            _review_display_row(enriched, qualifies, reject_reasons if not qualifies else review_reasons)
+        )
         if qualifies:
             candidates.append(enriched)
 
@@ -461,6 +511,7 @@ def load_morning_watchlist(now_et=None):
         )
         if mixed_directions:
             decision_reason += "; top-ranked contract selected for execution"
+        reviewed_rows = sorted(reviewed_by_symbol.get(symbol, []), key=lambda row: (-int(row.get("oi_diff") or 0), row.get("dte") or 9999))
         decisions[symbol] = {
             "symbol": symbol,
             "status": decision_status,
@@ -476,6 +527,10 @@ def load_morning_watchlist(now_et=None):
             "option_type": "CALL" if direction == "bullish" else "PUT",
             "trigger_levels": [],
             "target_levels": [],
+            "reviewed_rows": reviewed_rows,
+            "reviewed_count": len(reviewed_rows),
+            "reviewed_accepted_count": sum(1 for row in reviewed_rows if row.get("review_status") == "accepted"),
+            "reviewed_rejected_count": sum(1 for row in reviewed_rows if row.get("review_status") == "rejected"),
             "flow_rows": [_candidate_display_row(candidate) for candidate in ordered],
             "key_levels": [],
             "contract_plan": {

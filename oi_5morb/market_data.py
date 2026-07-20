@@ -166,3 +166,52 @@ def get_premarket_high_low(symbol, trading_day):
     if premarket.empty:
         return None
     return float(premarket["high"].max()), float(premarket["low"].min())
+
+
+def get_session_close_price(symbol, session_day):
+    bars = daily_bars(symbol, session_day, session_day)
+    if not bars.empty:
+        session_bars = bars[bars.index.date == session_day]
+        if not session_bars.empty:
+            close_price = session_bars["close"].dropna()
+            if not close_price.empty:
+                return float(close_price.iloc[-1])
+
+    start_et = datetime.combine(session_day, REGULAR_OPEN, ET)
+    end_et = datetime.combine(session_day, dt_time(16, 0), ET)
+    intraday = intraday_bars(symbol, start_et, end_et, prepost=False)
+    if intraday.empty:
+        return None
+    close_price = intraday["close"].dropna()
+    if close_price.empty:
+        return None
+    return float(close_price.iloc[-1])
+
+
+def get_next_session_reference_price(symbol, trading_day):
+    premarket_start = datetime.combine(trading_day, PREMARKET_START, ET)
+    regular_open = datetime.combine(trading_day, REGULAR_OPEN, ET)
+    premarket = intraday_bars(symbol, premarket_start, regular_open, prepost=True)
+    if not premarket.empty:
+        premarket = premarket[(premarket.index >= premarket_start) & (premarket.index < regular_open)]
+        if not premarket.empty:
+            open_prices = premarket["open"].dropna()
+            if not open_prices.empty:
+                return float(open_prices.iloc[0])
+
+    regular_open_end = regular_open + timedelta(minutes=5)
+    regular = intraday_bars(symbol, regular_open, regular_open_end, prepost=False)
+    if regular.empty:
+        return None
+    open_prices = regular["open"].dropna()
+    if open_prices.empty:
+        return None
+    return float(open_prices.iloc[0])
+
+
+def overnight_gap_pct(symbol, prior_day, trading_day):
+    prior_close = get_session_close_price(symbol, prior_day)
+    reference_price = get_next_session_reference_price(symbol, trading_day)
+    if prior_close in (None, 0) or reference_price in (None, ""):
+        return None
+    return (float(reference_price) - float(prior_close)) / float(prior_close)

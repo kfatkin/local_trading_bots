@@ -30,6 +30,7 @@ from .config import (
     ET,
     FLOW_SCORE_PARTITION,
     LOGGER,
+    MAX_OVERNIGHT_GAP_PCT,
     MIN_FLOW_SCORE,
     NO_PROGRESS_EXIT_ENABLED,
     NO_PROGRESS_MIN_OPTION_GAIN_PCT,
@@ -59,6 +60,7 @@ from .config import (
 from .flow_data import query_flow_scores, summarize_flow_rows
 from .market_data import (
     get_day_high_low,
+    overnight_gap_pct,
     get_premarket_high_low,
     get_week_high_low,
     previous_calendar_week_sessions,
@@ -90,7 +92,7 @@ from .utils import create_client_order_id, get_value, is_option_asset, key_level
 
 
 CONTRACT_PREVIEW_LOCK = threading.Lock()
-CONTRACT_PREVIEW_STATUSES = {"orb_wait", "ready"}
+CONTRACT_PREVIEW_STATUSES = {"flow_preview", "orb_wait", "ready"}
 pending_sweep_confirmations = {}
 continuation_contexts = {}
 opening_ranges = {}
@@ -285,6 +287,7 @@ def should_preview_contract(decision):
         decision.get("status") in CONTRACT_PREVIEW_STATUSES
         and decision.get("option_type") in {"CALL", "PUT"}
         and decision.get("direction") in {"bullish", "bearish"}
+        and bool(decision.get("contract_plan"))
     )
 
 
@@ -454,10 +457,35 @@ def refresh_intraday_decisions(now_et=None):
                 decision["reason"] = f"Waiting for a 1m close outside the opening 5m range {orb['low']:.2f}-{orb['high']:.2f}"
 
 
-def morning_watchlist_setups(now_et):
+def morning_watchlist_setups(now_et, trading_day, prior_day):
     decisions = load_morning_watchlist(now_et=now_et)
     setups = {}
     for symbol, decision in decisions.items():
+        gap_pct = overnight_gap_pct(symbol, prior_day, trading_day)
+        if gap_pct is not None and abs(gap_pct) > MAX_OVERNIGHT_GAP_PCT:
+            decision["status"] = "skipped"
+            decision["reason"] = (
+                f"Skipped: overnight gap {gap_pct * 100:.1f}% exceeded "
+                f"{MAX_OVERNIGHT_GAP_PCT * 100:.1f}%"
+            )
+            decision["trigger_levels"] = []
+            decision["target_levels"] = []
+            decision["contract_plan"] = None
+            decision["contract_preview"] = empty_contract_preview(
+                symbol,
+                decision.get("option_type"),
+                status="skipped",
+                reason=decision["reason"],
+            )
+            LOGGER.info(
+                "%s skipped for session=%s due to overnight gap %.2f%% (threshold %.2f%%)",
+                symbol,
+                trading_day,
+                gap_pct * 100.0,
+                MAX_OVERNIGHT_GAP_PCT * 100.0,
+            )
+            continue
+
         direction = decision.get("direction") or "neutral"
         setups[symbol] = TradeSetup(
             symbol,
@@ -495,7 +523,7 @@ def prepare_daily_context(now_et=None, force=False):
             continuation_contexts.clear()
             opening_ranges.clear()
 
-        setups, decisions = morning_watchlist_setups(now_et)
+        setups, decisions = morning_watchlist_setups(now_et, trading_day, prior_day)
         refresh_intraday_decisions(now_et)
         preview_context = refreshed_preview_context(
             decisions,

@@ -407,8 +407,8 @@ def dashboard_status_payload():
         now_et = datetime.now(ET)
         prepare_daily_context(now_et=now_et)
         with CONTEXT_LOCK:
-            force_refresh = now_et.time() >= REGULAR_OPEN and any(
-                decision.get("status") in {"orb_wait", "ready"}
+            force_refresh = any(
+                decision.get("status") in {"flow_preview", "orb_wait", "ready"}
                 and not (decision.get("contract_preview") or {}).get("symbol")
                 for decision in (daily_context.get("decisions") or {}).values()
             )
@@ -460,6 +460,19 @@ def dashboard_status_payload():
         staged_count = sum(1 for decision in decisions if decision.get("status") == "staged")
         planned_count = sum(1 for decision in decisions if (decision.get("contract_preview") or {}).get("symbol"))
         orb_ready_count = sum(1 for decision in decisions if decision.get("status") == "ready")
+        planned_plays = [
+            {
+                "symbol": decision.get("symbol"),
+                "status": decision.get("status"),
+                "direction": decision.get("direction"),
+                "option_type": decision.get("option_type"),
+                "reason": decision.get("reason"),
+                "trigger_levels": decision.get("trigger_levels") or [],
+                "contract_preview": decision.get("contract_preview") or {},
+            }
+            for decision in decisions
+            if (decision.get("contract_preview") or {}).get("symbol")
+        ]
         context = {
             "session": daily_context.get("session"),
             "prior_session": daily_context.get("prior_session"),
@@ -469,6 +482,7 @@ def dashboard_status_payload():
             "staged_count": staged_count,
             "planned_count": planned_count,
             "orb_ready_count": orb_ready_count,
+            "planned_plays": planned_plays,
             "high_score_flow_count": sum(len(decision.get("flow_rows", [])) for decision in decisions),
             "last_attempt_seconds_ago": round(time.monotonic() - daily_context.get("last_attempt_monotonic", 0.0), 1),
             "account": daily_context.get("account") or {},
@@ -677,6 +691,10 @@ DASHBOARD_HTML = """<!doctype html>
     </header>
     <main>
         <section class="grid" id="metrics"></section>
+        <section>
+            <h2 class="section-title">Planned Plays</h2>
+            <div class="wide"><table id="planned-plays"></table></div>
+        </section>
         <section class="hidden" id="backtest-section">
             <h2 class="section-title">Backtest Results</h2>
             <div class="panel" id="backtest-panel"><span class="muted">Click Backtest to load the latest generated result.</span></div>
@@ -891,6 +909,19 @@ DASHBOARD_HTML = """<!doctype html>
                 ${preflightLine}${oneContract}${warnings}
             </div>`;
         }
+        function plannedPlay(decision) {
+            const preview = decision.contract_preview || {};
+            const trigger = decision.trigger_levels && decision.trigger_levels.length ? decision.trigger_levels[0] : null;
+            const directionClass = decision.direction === 'bullish' ? 'bullish' : decision.direction === 'bearish' ? 'bearish' : 'neutral';
+            return `<tr>
+                <td class="symbol">${esc(decision.symbol || '-')}</td>
+                <td><span class="${directionClass}">${esc(decision.direction || '-')}</span><br><span class="status-${esc(decision.status || 'pending')}">${esc(decisionStatusText(decision.status))}</span></td>
+                <td>${esc(preview.symbol || '-')}<br><span class="muted">${esc(preview.option_type || decision.option_type || '-')} exp ${expiry(preview.expiration)} ${preview.strike != null ? '$' + px(preview.strike) : ''}</span></td>
+                <td>${trigger ? `<strong>${esc(trigger.label || trigger.name || 'Trigger')}</strong><br><span class="muted">${esc(decision.direction === 'bullish' ? 'Break above' : 'Break below')} ${px(trigger.price)}</span>` : '<span class="muted">waiting on ORB</span>'}</td>
+                <td>${premium(preview.ask)}<br><span class="muted">Qty ${esc(preview.quantity || 0)} / Cost ${usd(preview.contract_cost)}</span></td>
+                <td>${esc(preview.reason || decision.reason || '-')}</td>
+            </tr>`;
+        }
         function contractText(row) {
             const parts = [row.option_type, row.strike, row.expiry].filter(Boolean).map(esc);
             const extra = [row.side && `Side ${esc(row.side)}`, row.size && `Size ${esc(row.size)}`, row.price && `Price ${esc(row.price)}`].filter(Boolean);
@@ -939,6 +970,39 @@ DASHBOARD_HTML = """<!doctype html>
                     <summary>${esc(decision.symbol)} qualifying morning OI contracts (${rows.length})</summary>
                     <table class="flow-table">
                         <thead><tr><th>Time</th><th>Score</th><th>Bias</th><th>Premium</th><th>Spot</th><th>Contract</th><th>Flags</th><th>Reasons</th></tr></thead>
+                        <tbody>${body}</tbody>
+                    </table>
+                </details>
+            </td></tr>`;
+        }
+        function reviewText(row) {
+            const items = row.review_reasons || row.reasons || [];
+            return items.length ? items.map(esc).join(', ') : '-';
+        }
+        function reviewedDetails(decision) {
+            const rows = decision.reviewed_rows || [];
+            if (!rows.length) {
+                return `<tr class="flow-detail-row"><td></td><td colspan="6"><span class="muted">No OI contracts were reviewed for this symbol.</span></td></tr>`;
+            }
+            const openAttr = expandedFlowSymbols.has(`${decision.symbol}-reviewed`) ? ' open' : '';
+            const body = rows.map(row => {
+                const statusClass = row.review_status === 'accepted' ? 'bullish' : 'bearish';
+                return `<tr>
+                    <td>${shortDateTime(row.scored_at)}</td>
+                    <td><strong>${esc(row.review_status || '-')}</strong><br><span class="muted">${esc(row.review_summary || '')}</span></td>
+                    <td><span class="${statusClass}">${esc(row.direction || '-')}</span><br><span class="muted">Conf ${pct(row.confidence)}</span></td>
+                    <td>${usd(row.premium)}<br><span class="muted">Largest ${usd(row.largest_premium)}</span></td>
+                    <td>${px(row.spot_price)}</td>
+                    <td>${contractText(row)}</td>
+                    <td>${flags(row)}</td>
+                    <td class="reasons">${reviewText(row)}</td>
+                </tr>`;
+            }).join('');
+            return `<tr class="flow-detail-row"><td></td><td colspan="6">
+                <details class="flow-details" data-symbol="${esc(decision.symbol)}-reviewed" ontoggle="toggleFlowDetail(this)"${openAttr}>
+                    <summary>${esc(decision.symbol)} reviewed OI contracts (${rows.length} / accepted ${esc(decision.reviewed_accepted_count || 0)} / rejected ${esc(decision.reviewed_rejected_count || 0)})</summary>
+                    <table class="flow-table">
+                        <thead><tr><th>Time</th><th>Status</th><th>Bias</th><th>Premium</th><th>Spot</th><th>Contract</th><th>Flags</th><th>Reasons</th></tr></thead>
                         <tbody>${body}</tbody>
                     </table>
                 </details>
@@ -1043,6 +1107,7 @@ DASHBOARD_HTML = """<!doctype html>
                 metric('Trade Events', (data.daily_trade_state.events || []).length)
             ].join('');
             table('alpaca', ['Area', 'Status', 'Details'], alpacaStatusRows(data), 'Alpaca account and clock details unavailable.');
+            table('planned-plays', ['Symbol', 'Direction', 'Planned Contract', 'Trigger', 'Sizing', 'Reason'], (data.daily_context.planned_plays || []).map(plannedPlay), 'No planned plays yet.');
             table('decisions', ['Symbol', 'Decision', 'Consensus', 'Key Levels', 'Planned Contract', 'Entry Level', 'Reason'], data.decisions.flatMap(d => {
                 const directionClass = d.direction === 'bullish' ? 'bullish' : d.direction === 'bearish' ? 'bearish' : 'neutral';
                 const mainRow = `<tr>
@@ -1052,9 +1117,9 @@ DASHBOARD_HTML = """<!doctype html>
                     <td>${keyLevels(d)}</td>
                     <td>${contractPreview(d)}</td>
                     <td>${entryLevel(d)}</td>
-                    <td>${esc(d.reason || '')}<br><span class="muted">Rows ${esc(d.directional_row_count || 0)} of ${esc(d.raw_row_count || 0)}</span></td>
+                    <td>${esc(d.reason || '')}<br><span class="muted">Rows ${esc(d.directional_row_count || 0)} of ${esc(d.raw_row_count || 0)} / reviewed ${esc(d.reviewed_accepted_count || 0)} accepted, ${esc(d.reviewed_rejected_count || 0)} rejected</span></td>
                 </tr>`;
-                return [mainRow, flowDetails(d)];
+                return [mainRow, reviewedDetails(d), flowDetails(d)];
             }), 'No decisions prepared yet.');
             table('positions', ['Symbol', 'Broker Position', 'Alpaca PnL', 'Qty', 'Stop Plan', 'Take Profit', 'Status'], data.active_positions.map(p => `<tr>
                 <td class="symbol">${esc(p.symbol)}</td>
