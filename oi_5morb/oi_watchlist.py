@@ -225,7 +225,7 @@ def _compute_dte(current_date, expiration):
     return (expiry - current).days
 
 
-def _normalize_row(row):
+def _normalize_row(row, session_date=None):
     option_symbol = str(_row_value(row, "option_symbol", "optionSymbol") or "").strip().upper()
     underlying_symbol = str(_row_value(row, "underlying_symbol", "underlyingSymbol") or "").strip().upper()
     if not option_symbol or not underlying_symbol:
@@ -238,15 +238,18 @@ def _normalize_row(row):
     if option_type not in {"call", "put"}:
         return None
 
+    effective_current_date = (session_date or datetime.now(ET).date()).isoformat()
+
     return {
         "optionSymbol": option_symbol,
         "underlyingSymbol": underlying_symbol,
         "optionType": option_type,
         "expiration": contract["expiration"],
         "strike": contract["strike"],
-        "currentDate": current_date,
+        "currentDate": effective_current_date,
         "previousDate": previous_date,
-        "dte": _compute_dte(current_date, contract["expiration"]),
+        # DTE must be relative to today's session date, not a stale OI snapshot date.
+        "dte": _compute_dte(effective_current_date, contract["expiration"]),
         "currentOi": _to_number(_row_value(row, "curr_oi", "currentOi")),
         "previousOi": _to_number(_row_value(row, "last_oi", "previousOi")),
         "oiDiff": _to_number(_row_value(row, "oi_diff_plain", "oiDiff")),
@@ -461,7 +464,15 @@ def load_morning_watchlist(now_et=None):
         # Fail open so the bot and dashboard still run even if UW temporarily blocks API access.
         LOGGER.warning("Morning OI watchlist fetch failed; continuing with empty watchlist: %s", exc)
         return {}
-    normalized = [row for row in (_normalize_row(item) for item in raw_rows if isinstance(item, dict)) if row]
+    normalized = [
+        row
+        for row in (
+            _normalize_row(item, session_date=now_et.date())
+            for item in raw_rows
+            if isinstance(item, dict)
+        )
+        if row
+    ]
 
     quote_types = {}
     try:

@@ -389,18 +389,24 @@ def summarize_candidate(candidate):
 
 def best_contract_candidate(symbol, option_type, contract_plan=None):
     contract_plan = contract_plan or {}
-    expiration = contract_plan.get("expiration")
-    if isinstance(expiration, str) and expiration:
-        expiration = datetime.fromisoformat(expiration).date()
-    else:
-        expiration = None
+    today = datetime.now(ET).date()
+    requested_expiration = contract_plan.get("expiration")
+    expiration = None
+    if isinstance(requested_expiration, str) and requested_expiration:
+        try:
+            expiration = datetime.fromisoformat(requested_expiration).date()
+        except ValueError:
+            expiration = None
+    planned_expired = bool(expiration and expiration < today)
+    # If the planned expiry is stale, search active expirations from today forward.
+    search_expiration = expiration if expiration and not planned_expired else None
 
     min_price = optional_float(contract_plan.get("min_price"))
     max_price = optional_float(contract_plan.get("max_price"))
     anchor_strike = optional_float(contract_plan.get("strike"))
     exact_symbol = normalize_text(contract_plan.get("option_symbol")) or None
 
-    contracts = fetch_active_contracts(symbol, option_type, expiration=expiration)
+    contracts = fetch_active_contracts(symbol, option_type, expiration=search_expiration)
     if not contracts:
         return None, [], "No active option contracts found"
 
@@ -453,8 +459,10 @@ def best_contract_candidate(symbol, option_type, contract_plan=None):
 
         selected = min(enriched, key=lambda candidate: liquidity_rank(candidate, anchor_strike=anchor_strike))
         reason = "Selected from nearest expiration candidate band"
-        if expiration:
+        if requested_expiration and expiration and not planned_expired:
             reason = f"Selected from planned expiration {expiration.isoformat()}"
+        elif planned_expired:
+            reason = "Planned expiration was stale; selected from nearest active expiration candidate band"
         if min_price is not None or max_price is not None:
             reason += f" within ${min_price if min_price is not None else 0:.2f}-${max_price if max_price is not None else 9999:.2f}"
         if not selected.get("liquidity_pass"):
